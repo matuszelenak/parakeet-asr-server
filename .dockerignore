@@ -1,0 +1,20 @@
+# Build context for prod.Dockerfile (repo root). Keep it small and avoid
+# leaking local state into the image.
+.git
+.idea
+.vscode
+.claude
+.env
+
+# Python
+**/.venv
+**/__pycache__
+**/*.pyc
+
+# Node / Deno (installed fresh inside the build)
+**/node_modules
+**/dist
+
+# Local model caches / scratch
+models/
+*.wav

@@ -1,0 +1,26 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: prod.Dockerfile
+    image: parakeet-asr:prod
+    container_name: parakeet-asr-server
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+    environment:
+      NUM_WORKERS: ${NUM_WORKERS:-}
+      MODEL_NAME: ${MODEL_NAME:-nvidia/canary-1b-v2}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-200}
+      LOGFIRE_TOKEN: ${LOGFIRE_TOKEN:-}
+    volumes:
+      - /mnt/nvme/huggingface:/cache/hf
+      - /mnt/nvme/torch_cache:/cache/torch
+    shm_size: "2gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]
