@@ -1,7 +1,8 @@
 {
   "tasks": {
-    "dev": "vite --host 0.0.0.0",
-    "build": "vite build",
+    "copy-assets": "cp node_modules/@ricky0123/vad-web/dist/vad.worklet.bundle.min.js public/ && cp node_modules/@ricky0123/vad-web/dist/silero_vad_v5.onnx public/ && cp node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.wasm public/",
+    "dev": "deno task copy-assets && vite --host 0.0.0.0",
+    "build": "deno task copy-assets && vite build",
     "preview": "vite preview --host 0.0.0.0",
     "check": "svelte-check --tsconfig ./tsconfig.app.json"
   },

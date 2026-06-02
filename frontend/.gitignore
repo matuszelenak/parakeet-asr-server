@@ -12,6 +12,12 @@ dist
 dist-ssr
 *.local
 
+# VAD / ONNX Runtime assets copied into public/ by deno task copy-assets
+public/*.onnx
+public/*.wasm
+public/*.mjs
+public/vad.worklet.bundle.min.js
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

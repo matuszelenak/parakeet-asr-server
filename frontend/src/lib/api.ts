@@ -1,4 +1,4 @@
-// By default the API is assumed to live at the same address the frontend was
+// By default, the API is assumed to live at the same address the frontend was
 // opened from (same protocol/host/port). Requests are routed to the backend by
 // a same-origin proxy: the Vite dev server in development.
 // Set VITE_API_BASE to point at a different origin if you are not proxying.
@@ -56,6 +56,9 @@ export interface StreamEvent {
   id: number
 }
 
+// State of the live transcription pipeline reported to the UI.
+export type LiveState = 'listening' | 'speaking' | 'committing'
+
 export async function fetchCapabilities(): Promise<Capabilities> {
   const res = await fetch(`${BASE}/health`)
   if (!res.ok) return { supportsLanguages: false, languages: [] }
@@ -71,31 +74,37 @@ export interface TranscribeOptions {
   targetLang?: string
 }
 
-export class StreamTranscriber {
+// VAD gates the microphone so only speech frames reach the server.
+// The WebSocket streaming endpoint drives real-time partial→committed transcription.
+// After the user stops speaking a configurable delay elapses, then {type:'end'} is
+// sent which causes the server to finalise the current segment and close the
+// connection. The class then reopens the WebSocket automatically for the next
+// utterance.
+export class VadTranscriber {
+  private myvad: import('@ricky0123/vad-web').MicVAD | null = null
   private ws: WebSocket | null = null
-  private audioCtx: AudioContext | null = null
-  private source: MediaStreamAudioSourceNode | null = null
-  private processor: ScriptProcessorNode | null = null
-  private stream: MediaStream | null = null
+  private _wsOptions: TranscribeOptions = {}
+  private _speaking = false
   private _stopping = false
+  private _expectingClose = false
+  private _commitTimer: ReturnType<typeof setTimeout> | null = null
 
   constructor(
     private readonly onEvent: (event: StreamEvent) => void,
+    private readonly onActivity: (prob: number, speaking: boolean) => void,
+    private readonly onState: (state: LiveState) => void,
     private readonly onError: (message: string) => void,
-    private readonly onDone: () => void,
   ) {}
 
-  async start(options: TranscribeOptions = {}): Promise<void> {
-    this._stopping = false
-
+  private async _openWs(): Promise<void> {
+    const options = this._wsOptions
     const params = new URLSearchParams()
     if (options.sourceLang) params.set('source_lang', options.sourceLang)
     if (options.targetLang) params.set('target_lang', options.targetLang)
     const qs = params.toString() ? `?${params}` : ''
     const wsBase = BASE.replace(/^https:/, 'wss:').replace(/^http:/, 'ws:')
-    const url = `${wsBase}/v1/transcribe/stream${qs}`
 
-    this.ws = new WebSocket(url)
+    this.ws = new WebSocket(`${wsBase}/v1/transcribe/stream${qs}`)
     this.ws.binaryType = 'arraybuffer'
 
     await new Promise<void>((resolve, reject) => {
@@ -103,77 +112,114 @@ export class StreamTranscriber {
       this.ws!.onerror = () => reject(new Error('Could not connect to server'))
     })
 
-    this.ws.onmessage = (ev: MessageEvent) => {
-      try {
-        this.onEvent(JSON.parse(ev.data as string) as StreamEvent)
-      } catch {}
+    this.ws.onmessage = (ev) => {
+      try { this.onEvent(JSON.parse(ev.data as string) as StreamEvent) } catch {}
     }
     this.ws.onerror = () => {
-      if (!this._stopping) this.onError('WebSocket error')
+      if (!this._stopping && !this._expectingClose) this.onError('WebSocket error')
     }
+    // When we sent {type:'end'} the server finalises and closes the socket.
+    // Reopen it silently for the next utterance.
     this.ws.onclose = () => {
-      if (!this._stopping) this.onError('Connection closed unexpectedly')
-      this.onDone()
-    }
-
-    if (!navigator.mediaDevices?.getUserMedia) {
-      throw new Error(
-        'Microphone access requires a secure context. ' +
-        'Open the app over HTTPS or via localhost (not a plain HTTP IP address).',
-      )
-    }
-
-    this.stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-    this.audioCtx = new AudioContext({ sampleRate: 16_000 })
-    this.source = this.audioCtx.createMediaStreamSource(this.stream)
-    this.processor = this.audioCtx.createScriptProcessor(4096, 1, 1)
-
-    this.processor.onaudioprocess = (ev: AudioProcessingEvent) => {
-      if (this.ws?.readyState !== WebSocket.OPEN) return
-      const f32 = ev.inputBuffer.getChannelData(0)
-      const i16 = new Int16Array(f32.length)
-      for (let i = 0; i < f32.length; i++) {
-        i16[i] = Math.max(-32768, Math.min(32767, Math.round(f32[i] * 32767)))
+      if (this._expectingClose && !this._stopping) {
+        this._expectingClose = false
+        this._openWs().then(() => {
+          this.onState('listening')
+        }).catch(() => {
+          if (!this._stopping) this.onError('Failed to reconnect after commit')
+        })
+      } else if (!this._stopping) {
+        this.onError('Connection closed unexpectedly')
       }
-      this.ws.send(i16.buffer)
     }
-
-    // Muted gain node: keeps the processor running without echoing mic to speakers.
-    const muted = this.audioCtx.createGain()
-    muted.gain.value = 0
-    this.source.connect(this.processor)
-    this.processor.connect(muted)
-    muted.connect(this.audioCtx.destination)
   }
 
-  stop(): void {
+  async start(options: TranscribeOptions = {}, commitDelay = 500): Promise<void> {
+    this._stopping = false
+    this._wsOptions = options
+
+    await this._openWs()
+    this.onState('listening')
+
+    const { MicVAD } = await import('@ricky0123/vad-web')
+
+    this.myvad = await MicVAD.new({
+      model: 'v5',
+      startOnLoad: true,
+      baseAssetPath: '/',
+      onnxWASMBasePath: '/',
+      ortConfig: (ort) => {
+        ort.env.logLevel = 'error'
+        ort.env.wasm.numThreads = 1
+      },
+      onFrameProcessed: (probs, frame) => {
+        this.onActivity(probs.isSpeech, this._speaking)
+        if (this._speaking && this.ws?.readyState === WebSocket.OPEN) {
+          const i16 = new Int16Array(frame.length)
+          for (let i = 0; i < frame.length; i++) {
+            i16[i] = Math.max(-32768, Math.min(32767, Math.round(frame[i] * 32767)))
+          }
+          this.ws.send(i16.buffer)
+        }
+      },
+      onSpeechStart: () => {
+        // Cancel any pending commit if the user starts speaking again.
+        if (this._commitTimer !== null) {
+          clearTimeout(this._commitTimer)
+          this._commitTimer = null
+        }
+        this._speaking = true
+        this.onActivity(1, true)
+        this.onState('speaking')
+      },
+      onSpeechRealStart: () => {},
+      onVADMisfire: () => {
+        this._speaking = false
+        this.onActivity(0, false)
+        this.onState('listening')
+      },
+      onSpeechEnd: () => {
+        this._speaking = false
+        this.onActivity(0, false)
+        this.onState('committing')
+        // After the delay, tell the server to finalise and commit.
+        this._commitTimer = setTimeout(() => {
+          this._commitTimer = null
+          if (!this._stopping && this.ws?.readyState === WebSocket.OPEN) {
+            this._expectingClose = true
+            this.ws.send(JSON.stringify({ type: 'end' }))
+          }
+        }, commitDelay)
+      },
+    })
+  }
+
+  async stop(): Promise<void> {
     this._stopping = true
-    if (this.processor) {
-      this.processor.onaudioprocess = null
-      this.processor.disconnect()
-      this.processor = null
+    this._speaking = false
+    if (this._commitTimer !== null) {
+      clearTimeout(this._commitTimer)
+      this._commitTimer = null
     }
-    if (this.source) {
-      this.source.disconnect()
-      this.source = null
-    }
-    if (this.stream) {
-      this.stream.getTracks().forEach(t => t.stop())
-      this.stream = null
-    }
-    if (this.audioCtx) {
-      this.audioCtx.close()
-      this.audioCtx = null
-    }
+    if (this.myvad?.listening) await this.myvad.pause()
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({ type: 'end' }))
     }
   }
 
-  close(): void {
+  async destroy(): Promise<void> {
     this._stopping = true
+    if (this._commitTimer !== null) {
+      clearTimeout(this._commitTimer)
+      this._commitTimer = null
+    }
+    if (this.myvad) {
+      try { await this.myvad.destroy() } catch {}
+      this.myvad = null
+    }
     this.ws?.close()
     this.ws = null
+    this._speaking = false
   }
 }
 

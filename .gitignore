@@ -2,7 +2,6 @@
 .venv/
 __pycache__/
 *.pyc
-server/uv.lock
 
 # Node / Deno
 node_modules/

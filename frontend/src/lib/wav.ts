@@ -1,6 +1,6 @@
 // Decode an arbitrary audio Blob (e.g. webm/opus from MediaRecorder, or an
 // uploaded file) and re-encode it as a 16 kHz mono 16-bit PCM WAV. The backend
-// accepts any WAV, but normalising here keeps uploads small and consistent.
+// accepts any WAV, but normalizing here keeps uploads small and consistent.
 
 const TARGET_SAMPLE_RATE = 16000
 
@@ -21,7 +21,7 @@ export async function blobToWav16kMono(blob: Blob): Promise<Blob> {
   }
 
   // Resample + downmix to mono via an OfflineAudioContext. Routing a
-  // multi-channel source into a 1-channel destination downmixes per spec.
+  // multichannel source into a 1-channel destination downmixes per spec.
   const frameCount = Math.max(1, Math.ceil(decoded.duration * TARGET_SAMPLE_RATE))
   const offline = new OfflineAudioContext(1, frameCount, TARGET_SAMPLE_RATE)
   const source = offline.createBufferSource()
@@ -31,6 +31,10 @@ export async function blobToWav16kMono(blob: Blob): Promise<Blob> {
   const rendered = await offline.startRendering()
 
   return encodeWav(rendered.getChannelData(0), TARGET_SAMPLE_RATE)
+}
+
+export function float32ToWav(samples: Float32Array, sampleRate = 16000): Blob {
+  return encodeWav(samples, sampleRate)
 }
 
 function encodeWav(samples: Float32Array, sampleRate: number): Blob {
