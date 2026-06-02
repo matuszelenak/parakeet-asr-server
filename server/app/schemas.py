@@ -50,6 +50,19 @@ class StreamEvent(BaseModel):
     id: int
 
 
+class StreamConfig(BaseModel):
+    """Optional per-session overrides sent by the client as the first WebSocket
+    message: ``{"type": "configure", ...}``.  Any omitted field falls back to
+    the server-side default from ``Settings``."""
+
+    min_duration: float | None = None
+    retranscribe_interval: float | None = None
+    stable_words: int | None = None
+    stable_iters: int | None = None
+    max_duration: float | None = None
+    context_duration: float | None = None
+
+
 class HealthResponse(BaseModel):
     status: str
     model: str

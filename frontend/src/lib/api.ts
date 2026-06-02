@@ -59,6 +59,24 @@ export interface StreamEvent {
 // State of the live transcription pipeline reported to the UI.
 export type LiveState = 'listening' | 'speaking' | 'committing'
 
+export interface StreamParams {
+  minDuration: number
+  retranscribeInterval: number
+  stableWords: number
+  stableIters: number
+  maxDuration: number
+  contextDuration: number
+}
+
+export const STREAM_PARAM_DEFAULTS: StreamParams = {
+  minDuration: 1.0,
+  retranscribeInterval: 0.5,
+  stableWords: 4,
+  stableIters: 2,
+  maxDuration: 30.0,
+  contextDuration: 3.0,
+}
+
 export async function fetchCapabilities(): Promise<Capabilities> {
   const res = await fetch(`${BASE}/health`)
   if (!res.ok) return { supportsLanguages: false, languages: [] }
@@ -84,6 +102,7 @@ export class VadTranscriber {
   private myvad: import('@ricky0123/vad-web').MicVAD | null = null
   private ws: WebSocket | null = null
   private _wsOptions: TranscribeOptions = {}
+  private _streamParams: StreamParams = STREAM_PARAM_DEFAULTS
   private _speaking = false
   private _stopping = false
   private _expectingClose = false
@@ -112,6 +131,19 @@ export class VadTranscriber {
       this.ws!.onerror = () => reject(new Error('Could not connect to server'))
     })
 
+    // Send inference parameters as the first frame so the server can apply
+    // them before any audio arrives.
+    const p = this._streamParams
+    this.ws.send(JSON.stringify({
+      type: 'configure',
+      min_duration: p.minDuration,
+      retranscribe_interval: p.retranscribeInterval,
+      stable_words: p.stableWords,
+      stable_iters: p.stableIters,
+      max_duration: p.maxDuration,
+      context_duration: p.contextDuration,
+    }))
+
     this.ws.onmessage = (ev) => {
       try { this.onEvent(JSON.parse(ev.data as string) as StreamEvent) } catch {}
     }
@@ -134,9 +166,14 @@ export class VadTranscriber {
     }
   }
 
-  async start(options: TranscribeOptions = {}, commitDelay = 500): Promise<void> {
+  async start(
+    options: TranscribeOptions = {},
+    commitDelay = 500,
+    streamParams: StreamParams = STREAM_PARAM_DEFAULTS,
+  ): Promise<void> {
     this._stopping = false
     this._wsOptions = options
+    this._streamParams = streamParams
 
     await this._openWs()
     this.onState('listening')

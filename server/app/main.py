@@ -30,6 +30,7 @@ from .schemas import (
     HealthResponse,
     LanguageInfo,
     SegmentTimestamp,
+    StreamConfig,
     StreamEvent,
     TimestampedResponse,
     TranscriptionResponse,
@@ -248,6 +249,42 @@ async def transcribe_stream(
 
     audio_queue: asyncio.Queue[np.ndarray | None] = asyncio.Queue()
 
+    # --- Read optional per-session configure message ----------------------------
+    # The client MAY send {"type": "configure", ...overrides} as its very first
+    # frame.  We wait up to 2 s; if no text frame arrives (or it isn't a
+    # configure message) we fall through using server defaults.  A binary audio
+    # frame that arrives before any configure message is decoded and queued so
+    # no audio is lost.
+    cfg = StreamConfig()
+    try:
+        first = await asyncio.wait_for(websocket.receive(), timeout=2.0)
+        if first.get("text"):
+            try:
+                msg = json.loads(first["text"])
+                if msg.get("type") == "configure":
+                    cfg = StreamConfig.model_validate(
+                        {k: v for k, v in msg.items() if k != "type"}
+                    )
+            except (json.JSONDecodeError, AttributeError, ValueError):
+                pass
+        elif first.get("bytes"):
+            samples = (
+                np.frombuffer(first["bytes"], dtype=np.int16).astype(np.float32)
+                / 32768.0
+            )
+            await audio_queue.put(samples)
+    except asyncio.TimeoutError:
+        pass
+
+    # Resolve each field: client value → server default.
+    min_duration        = cfg.min_duration        if cfg.min_duration        is not None else settings.stream_min_duration
+    retranscribe_interval = cfg.retranscribe_interval if cfg.retranscribe_interval is not None else settings.stream_retranscribe_interval
+    stable_words        = cfg.stable_words        if cfg.stable_words        is not None else settings.stream_stable_words
+    stable_iters        = cfg.stable_iters        if cfg.stable_iters        is not None else settings.stream_stable_iters
+    max_duration        = cfg.max_duration        if cfg.max_duration        is not None else settings.stream_max_duration
+    context_duration    = cfg.context_duration    if cfg.context_duration    is not None else settings.stream_context_duration
+    # ----------------------------------------------------------------------------
+
     async def _reader() -> None:
         try:
             while True:
@@ -298,12 +335,12 @@ async def transcribe_stream(
             async for event in continuous_transcriber(
                 _transcribe,
                 _audio_gen(),
-                min_duration=settings.stream_min_duration,
-                retranscribe_interval=settings.stream_retranscribe_interval,
-                stable_words=settings.stream_stable_words,
-                stable_iters=settings.stream_stable_iters,
-                max_duration=settings.stream_max_duration,
-                context_duration=settings.stream_context_duration,
+                min_duration=min_duration,
+                retranscribe_interval=retranscribe_interval,
+                stable_words=stable_words,
+                stable_iters=stable_iters,
+                max_duration=max_duration,
+                context_duration=context_duration,
             ):
                 await websocket.send_text(event.model_dump_json())
     except WebSocketDisconnect:
