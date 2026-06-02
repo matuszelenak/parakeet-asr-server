@@ -1,15 +1,15 @@
 # Parakeet ASR Server
 
-A FastAPI service that serves NVIDIA's **Parakeet/Canary**
-(`nvidia/canary-1b-v2`) speech-to-text model, plus a Svelte frontend for
+A FastAPI service that serves NVIDIA's **Parakeet/Canary** speech-to-text model, plus a Svelte frontend for
 recording, uploading, and live-transcribing audio in the browser. Designed to
 run on a node with NVIDIA GPUs.
+
+![Parakeet](screenshot.png)
 
 ```
 .
 ├── server/      # FastAPI + NeMo API (managed with uv)
 ├── frontend/    # Svelte + TypeScript app (managed with Deno)
-├── vad/         # Silero VAD JS library (local clone, used by the frontend)
 └── docker-compose.yml
 ```
 
