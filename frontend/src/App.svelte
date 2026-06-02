@@ -13,20 +13,22 @@
   } from './lib/api'
   import { LANGUAGES, DEFAULT_LANGUAGE } from './lib/languages'
 
-  const MODES: { value: Mode; label: string; hint: string }[] = [
-    { value: 'plain', label: 'Plain text', hint: 'Just the transcript' },
+  type Tab = 'live' | Mode
+
+  const TABS: { value: Tab; label: string; hint: string }[] = [
+    { value: 'live',       label: 'Live',        hint: 'Real-time microphone' },
+    { value: 'plain',      label: 'Plain text',  hint: 'Just the transcript' },
     { value: 'timestamps', label: 'Timestamped', hint: 'Word & segment timings' },
-    { value: 'longform', label: 'Long form', hint: 'For very long recordings' },
+    { value: 'longform',   label: 'Long form',   hint: 'For very long recordings' },
   ]
 
-  let mode = $state<Mode>('plain')
+  let activeTab = $state<Tab>('live')
   let recording = $state(false)
   let busy = $state(false)
   let error = $state<string | null>(null)
   let result = $state<TranscriptionResult | null>(null)
   let audioUrl = $state<string | null>(null)
 
-  // Language selection — only shown when the configured model supports it.
   let supportsLanguages = $state(false)
   let languages = $state<LanguageInfo[]>(LANGUAGES)
   let sourceLang = $state<string>(DEFAULT_LANGUAGE)
@@ -153,7 +155,7 @@
     wavBlob = await blobToWav16kMono(raw)
     if (audioUrl) URL.revokeObjectURL(audioUrl)
     audioUrl = URL.createObjectURL(wavBlob)
-    result = nullz
+    result = null
   }
 
   async function runTranscription() {
@@ -162,7 +164,7 @@
     busy = true
     try {
       const options = supportsLanguages ? { sourceLang, targetLang } : {}
-      result = await transcribe(wavBlob, mode, options)
+      result = await transcribe(wavBlob, activeTab as Mode, options)
     } catch (e) {
       error = (e as Error).message
     } finally {
@@ -183,43 +185,14 @@
     <p>Record or upload audio and transcribe it with NVIDIA Parakeet/Canary.</p>
   </header>
 
-  <section class="card stream-section">
-    <h2>Live Transcription</h2>
-
-    <div class="controls">
-      {#if streaming}
-        <button class="record stop" onclick={stopStream}>⏹ Stop</button>
-        <span class="status pulse">Listening…</span>
-      {:else}
-        <button class="record" onclick={startStream}>🎙 Start</button>
-      {/if}
-    </div>
-
-    <div class="live-transcript" class:live-transcript--active={streaming}>
-      {#if committedText && partialText}
-        <strong>{committedText}</strong> <em>{partialText}</em>
-      {:else if committedText}
-        <strong>{committedText}</strong>
-      {:else if partialText}
-        <em>{partialText}</em>
-      {:else}
-        <span class="placeholder">Transcript will appear here as you speak…</span>
-      {/if}
-    </div>
-
-    {#if streamError}
-      <p class="error">⚠ {streamError}</p>
-    {/if}
-  </section>
-
   <section class="card">
     <fieldset class="modes">
       <legend>Mode</legend>
-      {#each MODES as m (m.value)}
-        <label class="mode" class:selected={mode === m.value}>
-          <input type="radio" name="mode" value={m.value} bind:group={mode} />
-          <span class="mode-label">{m.label}</span>
-          <span class="mode-hint">{m.hint}</span>
+      {#each TABS as tab (tab.value)}
+        <label class="mode" class:selected={activeTab === tab.value}>
+          <input type="radio" name="mode" value={tab.value} bind:group={activeTab} />
+          <span class="mode-label">{tab.label}</span>
+          <span class="mode-hint">{tab.hint}</span>
         </label>
       {/each}
     </fieldset>
@@ -249,74 +222,95 @@
       {/if}
     {/if}
 
-    <div class="controls">
+    {#if activeTab === 'live'}
+      <div class="controls">
+        {#if streaming}
+          <button class="record stop" onclick={stopStream}>⏹ Stop</button>
+          <span class="status pulse">Listening…</span>
+        {:else}
+          <button class="record" onclick={startStream}>🎙 Start</button>
+        {/if}
+      </div>
+      {#if streamError}
+        <p class="error">⚠ {streamError}</p>
+      {/if}
+    {:else}
+      <div class="controls">
+        {#if recording}
+          <button class="record stop" onclick={stopRecording}>⏹ Stop recording</button>
+        {:else}
+          <button class="record" onclick={startRecording} disabled={busy}>🎙 Record</button>
+        {/if}
+        <label class="upload">
+          📁 Upload WAV
+          <input type="file" accept="audio/wav,audio/*" onchange={onFile} disabled={busy || recording} />
+        </label>
+      </div>
+
       {#if recording}
-        <button class="record stop" onclick={stopRecording}>
-          ⏹ Stop recording
-        </button>
-      {:else}
-        <button class="record" onclick={startRecording} disabled={busy}>
-          🎙 Record
+        <p class="status pulse">Recording… speak now.</p>
+      {/if}
+
+      {#if audioUrl}
+        <audio controls src={audioUrl}></audio>
+        <button class="primary" onclick={runTranscription} disabled={busy || recording}>
+          {busy ? 'Transcribing…' : 'Transcribe'}
         </button>
       {/if}
 
-      <label class="upload">
-        📁 Upload WAV
-        <input type="file" accept="audio/wav,audio/*" onchange={onFile} disabled={busy || recording} />
-      </label>
+      {#if error}
+        <p class="error">⚠ {error}</p>
+      {/if}
+    {/if}
+
+    <!-- Unified output area -->
+    <div class="output" class:output--active={streaming}>
+      {#if activeTab === 'live'}
+        {#if committedText && partialText}
+          <strong>{committedText}</strong> <em>{partialText}</em>
+        {:else if committedText}
+          <strong>{committedText}</strong>
+        {:else if partialText}
+          <em>{partialText}</em>
+        {:else}
+          <span class="placeholder">Transcript will appear here as you speak…</span>
+        {/if}
+      {:else if result}
+        <p class="transcript">{result.text || '(empty)'}</p>
+      {:else}
+        <span class="placeholder">Record or upload audio, then click Transcribe…</span>
+      {/if}
     </div>
 
-    {#if recording}
-      <p class="status pulse">Recording… speak now.</p>
+    {#if result?.segments?.length}
+      <h3>Segments</h3>
+      <table>
+        <thead>
+          <tr><th>Start</th><th>End</th><th>Text</th></tr>
+        </thead>
+        <tbody>
+          {#each result.segments as seg (seg.start + seg.segment)}
+            <tr>
+              <td class="time">{fmt(seg.start)}</td>
+              <td class="time">{fmt(seg.end)}</td>
+              <td>{seg.segment}</td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
     {/if}
 
-    {#if audioUrl}
-      <audio controls src={audioUrl}></audio>
-      <button class="primary" onclick={runTranscription} disabled={busy || recording}>
-        {busy ? 'Transcribing…' : 'Transcribe'}
-      </button>
-    {/if}
-
-    {#if error}
-      <p class="error">⚠ {error}</p>
+    {#if result?.words?.length}
+      <details>
+        <summary>{result.words.length} word timestamps</summary>
+        <div class="words">
+          {#each result.words as w (w.start + w.word)}
+            <span class="word" title={`${fmt(w.start)} – ${fmt(w.end)}`}>{w.word}</span>
+          {/each}
+        </div>
+      </details>
     {/if}
   </section>
-
-  {#if result}
-    <section class="card result">
-      <h2>Transcript</h2>
-      <p class="transcript">{result.text || '(empty)'}</p>
-
-      {#if result.segments && result.segments.length}
-        <h3>Segments</h3>
-        <table>
-          <thead>
-            <tr><th>Start</th><th>End</th><th>Text</th></tr>
-          </thead>
-          <tbody>
-            {#each result.segments as seg (seg.start + seg.segment)}
-              <tr>
-                <td class="time">{fmt(seg.start)}</td>
-                <td class="time">{fmt(seg.end)}</td>
-                <td>{seg.segment}</td>
-              </tr>
-            {/each}
-          </tbody>
-        </table>
-      {/if}
-
-      {#if result.words && result.words.length}
-        <details>
-          <summary>{result.words.length} word timestamps</summary>
-          <div class="words">
-            {#each result.words as w (w.start + w.word)}
-              <span class="word" title={`${fmt(w.start)} – ${fmt(w.end)}`}>{w.word}</span>
-            {/each}
-          </div>
-        </details>
-      {/if}
-    </section>
-  {/if}
 </main>
 
 <style>
@@ -348,7 +342,7 @@
     padding: 0;
     margin: 0 0 1rem;
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: repeat(4, 1fr);
     gap: 0.5rem;
   }
   .modes legend {
@@ -487,12 +481,20 @@
     line-height: 1.6;
     font-size: 1.05rem;
     white-space: pre-wrap;
+    margin: 0;
   }
 
   table {
     width: 100%;
     border-collapse: collapse;
     font-size: 0.9rem;
+    margin-top: 1rem;
+  }
+  h3 {
+    margin: 1rem 0 0.25rem;
+    font-size: 0.95rem;
+    color: #9aa0ad;
+    font-weight: 600;
   }
   th, td {
     text-align: left;
@@ -523,12 +525,7 @@
     margin-top: 1rem;
   }
 
-  .stream-section h2 {
-    margin: 0 0 1rem;
-    font-size: 1.1rem;
-  }
-
-  .live-transcript {
+  .output {
     margin-top: 1rem;
     min-height: 6rem;
     padding: 0.75rem 1rem;
@@ -540,14 +537,14 @@
     white-space: pre-wrap;
     transition: border-color 0.2s;
   }
-  .live-transcript--active {
+  .output--active {
     border-color: #b3322c;
   }
-  .live-transcript strong {
+  .output strong {
     font-weight: 700;
     color: #e7e9ee;
   }
-  .live-transcript em {
+  .output em {
     font-style: italic;
     color: #9aa0ad;
   }

@@ -1,5 +1,6 @@
 services:
   server:
+    container_name: parakeet-asr-server-api
     build:
       context: ./server
     image: parakeet-asr-server
@@ -30,6 +31,7 @@ services:
           path: ./server/pyproject.toml
 
   frontend:
+    container_name: parakeet-asr-server-frontend
     build:
       context: ./frontend
       target: dev

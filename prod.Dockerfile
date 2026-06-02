@@ -41,7 +41,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 ENV UV_LINK_MODE=copy \
     UV_PYTHON_PREFERENCE=managed \
-    UV_COMPILE_BYTECODE=1 \
     UV_CONCURRENT_INSTALLS=8 \
     HF_HOME=/cache/hf \
     HF_HUB_CACHE=/cache/hf/hub \
