@@ -4,11 +4,17 @@ on:
   push:
     branches: [main]
     tags: ['v*']
+    paths:
+      - 'server/**'
+      - 'frontend/**'
+      - '**.Dockerfile'
+      - 'Dockerfile'
+      - '.github/workflows/**'
   workflow_dispatch:
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  GHCR_IMAGE: ghcr.io/${{ github.repository }}
+  DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}
 
 jobs:
   build-and-push:
@@ -35,15 +41,23 @@ jobs:
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Extract image metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: |
+            ${{ env.GHCR_IMAGE }}
+            ${{ env.DOCKERHUB_IMAGE }}
           tags: |
             type=ref,event=branch
             type=semver,pattern={{version}}
