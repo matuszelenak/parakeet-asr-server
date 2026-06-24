@@ -1,74 +1,65 @@
-"""Supported languages for models that accept source/target language selection.
+"""Languages understood by the Nemotron streaming ASR model.
 
-Some models (e.g. ``nvidia/canary-1b-v2``) accept ``source_lang`` and
-``target_lang`` arguments, enabling both transcription and speech translation.
-The language set below matches Canary v2's supported languages.
+The model is prompt-conditioned on a target language given as a BCP-47 locale
+(e.g. ``en-US``), or the special value ``auto`` to auto-detect the spoken
+language.  The list below is a curated subset of the model's supported locales;
+``auto`` is always available and is the default.
 """
 from __future__ import annotations
 
-from enum import Enum
+# Special value: let the model detect the language itself.
+AUTO = "auto"
 
+# Default used when the caller omits a language.
+DEFAULT_LANGUAGE = AUTO
 
-class Language(str, Enum):
-    bg = "bg"
-    hr = "hr"
-    cs = "cs"
-    da = "da"
-    nl = "nl"
-    en = "en"
-    et = "et"
-    fi = "fi"
-    fr = "fr"
-    de = "de"
-    el = "el"
-    hu = "hu"
-    it = "it"
-    lv = "lv"
-    lt = "lt"
-    mt = "mt"
-    pl = "pl"
-    pt = "pt"
-    ro = "ro"
-    sk = "sk"
-    sl = "sl"
-    es = "es"
-    sv = "sv"
-    ru = "ru"
-    uk = "uk"
-
-
-LANGUAGE_NAMES: dict[Language, str] = {
-    Language.bg: "Bulgarian",
-    Language.hr: "Croatian",
-    Language.cs: "Czech",
-    Language.da: "Danish",
-    Language.nl: "Dutch",
-    Language.en: "English",
-    Language.et: "Estonian",
-    Language.fi: "Finnish",
-    Language.fr: "French",
-    Language.de: "German",
-    Language.el: "Greek",
-    Language.hu: "Hungarian",
-    Language.it: "Italian",
-    Language.lv: "Latvian",
-    Language.lt: "Lithuanian",
-    Language.mt: "Maltese",
-    Language.pl: "Polish",
-    Language.pt: "Portuguese",
-    Language.ro: "Romanian",
-    Language.sk: "Slovak",
-    Language.sl: "Slovenian",
-    Language.es: "Spanish",
-    Language.sv: "Swedish",
-    Language.ru: "Russian",
-    Language.uk: "Ukrainian",
+# locale code -> human-readable name. Ordered for dropdown display.
+LANGUAGE_NAMES: dict[str, str] = {
+    "en-US": "English",
+    "es-ES": "Spanish",
+    "fr-FR": "French",
+    "de-DE": "German",
+    "it-IT": "Italian",
+    "pt-PT": "Portuguese",
+    "nl-NL": "Dutch",
+    "pl-PL": "Polish",
+    "sv-SE": "Swedish",
+    "cs-CZ": "Czech",
+    "sk-SK": "Slovak",
+    "da-DK": "Danish",
+    "nb-NO": "Norwegian",
+    "fi-FI": "Finnish",
+    "hu-HU": "Hungarian",
+    "ro-RO": "Romanian",
+    "hr-HR": "Croatian",
+    "bg-BG": "Bulgarian",
+    "et-EE": "Estonian",
+    "uk-UA": "Ukrainian",
+    "ru-RU": "Russian",
+    "tr-TR": "Turkish",
+    "ar": "Arabic",
+    "hi-IN": "Hindi",
+    "ja-JP": "Japanese",
+    "ko-KR": "Korean",
+    "vi-VN": "Vietnamese",
+    "zh-CN": "Mandarin Chinese",
 }
 
-# Default used when the model supports languages but the caller omits them.
-DEFAULT_LANGUAGE = Language.en
+# Full ordered list exposed to clients: Auto-detect first, then the locales.
+LANGUAGES: list[tuple[str, str]] = [(AUTO, "Auto-detect")] + list(
+    LANGUAGE_NAMES.items()
+)
+
+_VALID = {AUTO, *LANGUAGE_NAMES}
 
 
-def model_supports_languages(model_name: str) -> bool:
-    """Whether the configured model accepts source/target language arguments."""
-    return "canary" in model_name.lower()
+def is_supported(code: str | None) -> bool:
+    """Whether ``code`` is a language this model can be prompted with."""
+    return code is None or code in _VALID
+
+
+def resolve_language(code: str | None, default: str) -> str:
+    """Return a valid language prompt value, falling back to ``default``."""
+    if code and code in _VALID:
+        return code
+    return default

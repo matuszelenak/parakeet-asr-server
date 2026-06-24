@@ -1,4 +1,4 @@
-"""FastAPI application exposing Parakeet/Canary."""
+"""FastAPI application exposing NVIDIA Nemotron streaming ASR."""
 from __future__ import annotations
 
 import asyncio
@@ -16,30 +16,23 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.websockets import WebSocketDisconnect
 
-from .audio import InvalidAudioError, float32_to_wav_path, to_wav16k_mono
+from .audio import InvalidAudioError, to_wav16k_mono
 from .config import settings
-from .languages import (
-    DEFAULT_LANGUAGE,
-    LANGUAGE_NAMES,
-    Language,
-    model_supports_languages,
-)
+from .languages import LANGUAGES, is_supported
 from .model_pool import pool
 from .schemas import (
     CharTimestamp,
     HealthResponse,
     LanguageInfo,
     SegmentTimestamp,
-    StreamConfig,
-    StreamEvent,
     TimestampedResponse,
     TranscriptionResponse,
     WordTimestamp,
 )
-from .streaming import continuous_transcriber
+from .streaming import stream_transcribe
 
 logfire.configure(
-    service_name="parakeet-asr-server",
+    service_name="nemotron-asr-server",
     send_to_logfire="if-token-present",
 )
 logging.basicConfig(handlers=[logfire.LogfireLoggingHandler()], level=logging.INFO)
@@ -56,9 +49,9 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(
-    title="Parakeet ASR Server",
-    version="0.1.0",
-    description="Transcribe audio with NVIDIA Parakeet/Canary",
+    title="Nemotron ASR Server",
+    version="0.2.0",
+    description="Streaming speech recognition with NVIDIA Nemotron",
     lifespan=lifespan,
 )
 
@@ -101,57 +94,37 @@ def _result_text(result: Any) -> str:
     return getattr(result, "text", "") or ""
 
 
-def _resolve_languages(
-    source_lang: Language | None, target_lang: Language | None
-) -> dict[str, str]:
-    """Validate language args against the configured model's capabilities.
-
-    Returns kwargs (``source_lang`` / ``target_lang``) to pass to the model, or
-    an empty dict when the model does not use language selection.
-    """
-    if not model_supports_languages(settings.model_name):
-        if source_lang is not None or target_lang is not None:
-            raise HTTPException(
-                status_code=400,
-                detail="the configured model does not support language selection",
-            )
-        return {}
-
-    # Canary-style models require both; default to English when omitted.
-    src = source_lang or DEFAULT_LANGUAGE
-    tgt = target_lang or source_lang or DEFAULT_LANGUAGE
-    return {"source_lang": src.value, "target_lang": tgt.value}
+def _resolve_lang(target_lang: str | None) -> str:
+    """Validate the requested language and resolve to a model prompt value."""
+    if target_lang is not None and not is_supported(target_lang):
+        raise HTTPException(
+            status_code=400, detail=f"unsupported language: {target_lang}"
+        )
+    return target_lang or settings.target_lang
 
 
 @app.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
-    supports = model_supports_languages(settings.model_name)
-    languages = (
-        [LanguageInfo(code=lang.value, name=LANGUAGE_NAMES[lang]) for lang in Language]
-        if supports
-        else []
-    )
     return HealthResponse(
         status="ok" if pool.ready else "loading",
         model=settings.model_name,
         workers=pool.size,
         ready=pool.ready,
-        supports_languages=supports,
-        languages=languages,
+        supports_languages=True,
+        languages=[LanguageInfo(code=code, name=name) for code, name in LANGUAGES],
     )
 
 
 @app.post("/v1/transcribe", response_model=TranscriptionResponse)
 async def transcribe(
     file: UploadFile = File(...),
-    source_lang: Language | None = Form(None),
-    target_lang: Language | None = Form(None),
+    target_lang: str | None = Form(None),
 ) -> TranscriptionResponse:
-    """Plain-text transcription (or translation when target differs from source)."""
-    languages = _resolve_languages(source_lang, target_lang)
+    """Plain-text transcription of an uploaded audio file."""
+    lang = _resolve_lang(target_lang)
     path = await _read_and_prepare(file)
     try:
-        results = await pool.transcribe([path], **languages)
+        results = await pool.transcribe([path], target_lang=lang)
     finally:
         _cleanup(path)
     return TranscriptionResponse(text=_result_text(results[0]))
@@ -160,14 +133,13 @@ async def transcribe(
 @app.post("/v1/transcribe/timestamps", response_model=TimestampedResponse)
 async def transcribe_timestamps(
     file: UploadFile = File(...),
-    source_lang: Language | None = Form(None),
-    target_lang: Language | None = Form(None),
+    target_lang: str | None = Form(None),
 ) -> TimestampedResponse:
     """Transcription with word, segment, and char level timestamps."""
-    languages = _resolve_languages(source_lang, target_lang)
+    lang = _resolve_lang(target_lang)
     path = await _read_and_prepare(file)
     try:
-        results = await pool.transcribe([path], timestamps=True, **languages)
+        results = await pool.transcribe([path], timestamps=True, target_lang=lang)
     finally:
         _cleanup(path)
 
@@ -194,18 +166,18 @@ async def transcribe_timestamps(
 @app.post("/v1/transcribe/longform", response_model=TranscriptionResponse)
 async def transcribe_longform(
     file: UploadFile = File(...),
-    source_lang: Language | None = Form(None),
-    target_lang: Language | None = Form(None),
+    target_lang: str | None = Form(None),
 ) -> TranscriptionResponse:
-    """Long-form transcription using local-attention windowing.
+    """Transcription of a long recording.
 
-    Switches the encoder to limited-context self-attention so very long
-    recordings can be transcribed without exhausting GPU memory.
+    The cache-aware streaming encoder handles arbitrarily long audio with a
+    bounded memory footprint, so this is the same offline path as
+    ``/v1/transcribe``; it is kept as a distinct endpoint for API compatibility.
     """
-    languages = _resolve_languages(source_lang, target_lang)
+    lang = _resolve_lang(target_lang)
     path = await _read_and_prepare(file)
     try:
-        results = await pool.transcribe([path], longform=True, **languages)
+        results = await pool.transcribe([path], target_lang=lang)
     finally:
         _cleanup(path)
     return TranscriptionResponse(text=_result_text(results[0]))
@@ -214,33 +186,29 @@ async def transcribe_longform(
 @app.websocket("/v1/transcribe/stream")
 async def transcribe_stream(
     websocket: WebSocket,
-    source_lang: Language | None = None,
-    target_lang: Language | None = None,
+    target_lang: str | None = None,
 ) -> None:
-    """Continuous streaming transcription over WebSocket.
+    """Continuous streaming transcription over WebSocket (native cache-aware).
 
-    Optional query params ``source_lang`` and ``target_lang`` select the
-    language (e.g. ``?source_lang=sk&target_lang=en`` for Slovak→English
-    translation).  When omitted, English is used.  Invalid values cause the
-    WebSocket handshake to be rejected with HTTP 400.
+    Optional query param ``target_lang`` selects the language as a BCP-47 locale
+    (e.g. ``?target_lang=de-DE``) or ``auto`` to auto-detect.  When omitted, the
+    server default is used.
 
     The client sends raw PCM-16 mono 16 kHz audio as binary frames and signals
     end-of-stream with a text frame containing ``{"type": "end"}``.
 
     The server responds with JSON StreamEvent text frames::
 
-        {"type": "partial",   "text": "...", "start": 0.0, "id": 0}
-        {"type": "committed", "text": "...", "start": 0.0, "id": 0}
-        {"type": "final",     "text": "...", "start": 1.4, "id": 1}
+        {"type": "partial", "text": "...", "start": 0.0, "id": 0}
+        {"type": "final",   "text": "...", "start": 0.0, "id": 0}
 
-    ``partial``  – in-progress transcription of the current segment (may change).
-    ``committed``– confirmed segment; words will not be revised.
-    ``final``    – last segment emitted after end-of-stream.
+    ``partial`` – the running transcript of the session (replaces as it grows).
+    ``final``   – the complete transcript emitted after end-of-stream.
 
-    One pool worker is occupied for the duration of the session, so the maximum
+    One pool worker is held for the duration of the session, so the maximum
     number of concurrent streaming sessions equals the pool size.
     """
-    languages = _resolve_languages(source_lang, target_lang)
+    lang = target_lang if (target_lang and is_supported(target_lang)) else settings.target_lang
     await websocket.accept()
 
     if not pool.ready:
@@ -248,42 +216,6 @@ async def transcribe_stream(
         return
 
     audio_queue: asyncio.Queue[np.ndarray | None] = asyncio.Queue()
-
-    # --- Read optional per-session configure message ----------------------------
-    # The client MAY send {"type": "configure", ...overrides} as its very first
-    # frame.  We wait up to 2 s; if no text frame arrives (or it isn't a
-    # configure message) we fall through using server defaults.  A binary audio
-    # frame that arrives before any configure message is decoded and queued so
-    # no audio is lost.
-    cfg = StreamConfig()
-    try:
-        first = await asyncio.wait_for(websocket.receive(), timeout=2.0)
-        if first.get("text"):
-            try:
-                msg = json.loads(first["text"])
-                if msg.get("type") == "configure":
-                    cfg = StreamConfig.model_validate(
-                        {k: v for k, v in msg.items() if k != "type"}
-                    )
-            except (json.JSONDecodeError, AttributeError, ValueError):
-                pass
-        elif first.get("bytes"):
-            samples = (
-                np.frombuffer(first["bytes"], dtype=np.int16).astype(np.float32)
-                / 32768.0
-            )
-            await audio_queue.put(samples)
-    except asyncio.TimeoutError:
-        pass
-
-    # Resolve each field: client value → server default.
-    min_duration        = cfg.min_duration        if cfg.min_duration        is not None else settings.stream_min_duration
-    retranscribe_interval = cfg.retranscribe_interval if cfg.retranscribe_interval is not None else settings.stream_retranscribe_interval
-    stable_words        = cfg.stable_words        if cfg.stable_words        is not None else settings.stream_stable_words
-    stable_iters        = cfg.stable_iters        if cfg.stable_iters        is not None else settings.stream_stable_iters
-    max_duration        = cfg.max_duration        if cfg.max_duration        is not None else settings.stream_max_duration
-    context_duration    = cfg.context_duration    if cfg.context_duration    is not None else settings.stream_context_duration
-    # ----------------------------------------------------------------------------
 
     async def _reader() -> None:
         try:
@@ -318,31 +250,12 @@ async def transcribe_stream(
                 return
             yield chunk
 
-    async def _transcribe(samples: np.ndarray) -> Any:
-        path = float32_to_wav_path(samples)
-        try:
-            results = await pool.transcribe([path], timestamps=True, **languages)
-            return results[0]
-        except Exception as exc:
-            logfire.exception("streaming inference error: {exc}", exc=str(exc))
-            return None
-        finally:
-            _cleanup(path)
-
     reader_task = asyncio.create_task(_reader())
     try:
-        with logfire.span("transcribe_stream"):
-            async for event in continuous_transcriber(
-                _transcribe,
-                _audio_gen(),
-                min_duration=min_duration,
-                retranscribe_interval=retranscribe_interval,
-                stable_words=stable_words,
-                stable_iters=stable_iters,
-                max_duration=max_duration,
-                context_duration=context_duration,
-            ):
-                await websocket.send_text(event.model_dump_json())
+        with logfire.span("transcribe_stream", target_lang=lang):
+            async with pool.stream_session(target_lang=lang) as session:
+                async for event in stream_transcribe(session, _audio_gen()):
+                    await websocket.send_text(event.model_dump_json())
     except WebSocketDisconnect:
         pass
     finally:

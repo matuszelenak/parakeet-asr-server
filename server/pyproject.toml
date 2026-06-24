@@ -1,7 +1,7 @@
 [project]
-name = "parakeet-asr-server"
-version = "0.1.0"
-description = "FastAPI server exposing NVIDIA Parakeet/Canary ASR (plain / timestamped / long-form)"
+name = "nemotron-asr-server"
+version = "0.2.0"
+description = "FastAPI server exposing NVIDIA Nemotron cache-aware streaming ASR (live + plain / timestamped / long-form)"
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "uvicorn[standard]>=0.32",

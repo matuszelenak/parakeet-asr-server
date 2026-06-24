@@ -1,71 +1,43 @@
-// Languages supported by models with source/target language selection
-// (e.g. nvidia/canary-1b-v2). Mirrors the server-side Language enum.
-
-export enum Language {
-  bg = 'bg',
-  hr = 'hr',
-  cs = 'cs',
-  da = 'da',
-  nl = 'nl',
-  en = 'en',
-  et = 'et',
-  fi = 'fi',
-  fr = 'fr',
-  de = 'de',
-  el = 'el',
-  hu = 'hu',
-  it = 'it',
-  lv = 'lv',
-  lt = 'lt',
-  mt = 'mt',
-  pl = 'pl',
-  pt = 'pt',
-  ro = 'ro',
-  sk = 'sk',
-  sl = 'sl',
-  es = 'es',
-  sv = 'sv',
-  ru = 'ru',
-  uk = 'uk',
-}
-
-export const LANGUAGE_NAMES: Record<Language, string> = {
-  [Language.bg]: 'Bulgarian',
-  [Language.hr]: 'Croatian',
-  [Language.cs]: 'Czech',
-  [Language.da]: 'Danish',
-  [Language.nl]: 'Dutch',
-  [Language.en]: 'English',
-  [Language.et]: 'Estonian',
-  [Language.fi]: 'Finnish',
-  [Language.fr]: 'French',
-  [Language.de]: 'German',
-  [Language.el]: 'Greek',
-  [Language.hu]: 'Hungarian',
-  [Language.it]: 'Italian',
-  [Language.lv]: 'Latvian',
-  [Language.lt]: 'Lithuanian',
-  [Language.mt]: 'Maltese',
-  [Language.pl]: 'Polish',
-  [Language.pt]: 'Portuguese',
-  [Language.ro]: 'Romanian',
-  [Language.sk]: 'Slovak',
-  [Language.sl]: 'Slovenian',
-  [Language.es]: 'Spanish',
-  [Language.sv]: 'Swedish',
-  [Language.ru]: 'Russian',
-  [Language.uk]: 'Ukrainian',
-}
+// Languages the Nemotron streaming model can be prompted with. Mirrors the
+// server-side list (see server/app/languages.py); the live list is fetched
+// from /health at runtime, this is the fallback used before that resolves.
 
 export interface LanguageInfo {
   code: string
   name: string
 }
 
-// Ordered list for populating dropdowns.
-export const LANGUAGES: LanguageInfo[] = Object.values(Language).map((code) => ({
-  code,
-  name: LANGUAGE_NAMES[code],
-}))
+// "auto" lets the model detect and tag the spoken language.
+export const DEFAULT_LANGUAGE = 'auto'
 
-export const DEFAULT_LANGUAGE = Language.en
+export const LANGUAGES: LanguageInfo[] = [
+  { code: 'auto', name: 'Auto-detect' },
+  { code: 'en-US', name: 'English' },
+  { code: 'es-ES', name: 'Spanish' },
+  { code: 'fr-FR', name: 'French' },
+  { code: 'de-DE', name: 'German' },
+  { code: 'it-IT', name: 'Italian' },
+  { code: 'pt-PT', name: 'Portuguese' },
+  { code: 'nl-NL', name: 'Dutch' },
+  { code: 'pl-PL', name: 'Polish' },
+  { code: 'sv-SE', name: 'Swedish' },
+  { code: 'cs-CZ', name: 'Czech' },
+  { code: 'sk-SK', name: 'Slovak' },
+  { code: 'da-DK', name: 'Danish' },
+  { code: 'nb-NO', name: 'Norwegian' },
+  { code: 'fi-FI', name: 'Finnish' },
+  { code: 'hu-HU', name: 'Hungarian' },
+  { code: 'ro-RO', name: 'Romanian' },
+  { code: 'hr-HR', name: 'Croatian' },
+  { code: 'bg-BG', name: 'Bulgarian' },
+  { code: 'et-EE', name: 'Estonian' },
+  { code: 'uk-UA', name: 'Ukrainian' },
+  { code: 'ru-RU', name: 'Russian' },
+  { code: 'tr-TR', name: 'Turkish' },
+  { code: 'ar', name: 'Arabic' },
+  { code: 'hi-IN', name: 'Hindi' },
+  { code: 'ja-JP', name: 'Japanese' },
+  { code: 'ko-KR', name: 'Korean' },
+  { code: 'vi-VN', name: 'Vietnamese' },
+  { code: 'zh-CN', name: 'Mandarin Chinese' },
+]

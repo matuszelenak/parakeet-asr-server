@@ -1,10 +1,11 @@
-# Parakeet ASR Server
+# Nemotron ASR Server
 
-A FastAPI service that serves NVIDIA's **Parakeet/Canary** speech-to-text model, plus a Svelte frontend for
-recording, uploading, and live-transcribing audio in the browser. Designed to
-run on a node with NVIDIA GPUs.
+A FastAPI service that serves NVIDIA's **Nemotron** cache-aware streaming
+speech-to-text model (`nvidia/nemotron-3.5-asr-streaming-0.6b`), plus a Svelte
+frontend for recording, uploading, and live-transcribing audio in the browser.
+Designed to run on a node with NVIDIA GPUs.
 
-![Parakeet](screenshot.png)
+![Nemotron ASR](screenshot.png)
 
 ```
 .
@@ -13,19 +14,31 @@ run on a node with NVIDIA GPUs.
 └── docker-compose.yml
 ```
 
+> **Model requirement**: the streaming Nemotron model needs a recent NeMo
+> runtime (NeMo 26.06 / `main`). If the pinned `nemo-toolkit` in
+> `server/pyproject.toml` is older than the release that ships this model,
+> install NeMo from source (`pip install
+> "nemo_toolkit[asr] @ git+https://github.com/NVIDIA/NeMo.git@main"`).
+
 ## Features
 
-- **Three batch transcription modes** — plain text, word/segment/char
-  timestamps, and long-form (local-attention windowing for very long recordings).
-- **Live transcription** — real-time streaming transcription over WebSocket,
-  driven by client-side Silero VAD so only detected speech reaches the server.
+- **Native cache-aware streaming** — the model streams natively: audio is fed
+  chunk by chunk through the encoder while the encoder cache and the running
+  RNN-T hypothesis are carried forward between steps. No re-transcription or
+  stability heuristics — emitted tokens are not revised.
+- **Selectable latency** — the streaming look-ahead (`ATT_CONTEXT_SIZE`) trades
+  latency for accuracy: `[56,0]` ≈ 80 ms up to `[56,13]` ≈ 1.12 s.
+- **Offline modes** — plain text, word/segment/char timestamps, and a long-form
+  endpoint (the streaming encoder handles arbitrarily long audio).
+- **Live transcription** — real-time streaming over WebSocket, driven by
+  client-side Silero VAD so only detected speech reaches the server.
 - **Any audio in** — uploads are decoded, downmixed to mono, and resampled to
   16 kHz client-side before upload (WAV, WebM/Opus, and most browser formats).
-- **Parallel requests** — one model replica is loaded per GPU; requests check
-  out an idle replica from a queue, so N requests run concurrently across N GPUs.
-- **Language selection & translation** — models that support it (e.g.
-  `nvidia/canary-1b-v2`) accept `source_lang` / `target_lang`; setting them to
-  different values performs speech translation.
+- **Parallel requests** — one model replica is loaded per GPU; offline requests
+  check out an idle replica, and each live session holds one replica for its
+  duration, so concurrent streaming sessions are capped at the pool size.
+- **Multilingual** — the model transcribes ~40 locales. Pass `target_lang` as a
+  BCP-47 locale (e.g. `de-DE`) or `auto` to detect the language automatically.
 
 ## UI overview
 
@@ -38,8 +51,8 @@ The frontend is a single card with four mode tabs:
 | **Timestamped** | Record or upload → transcript + word/segment timings |
 | **Long form** | Record or upload → long-form transcript |
 
-Language selectors (source → target) appear at the top when the loaded model
-supports them; they are disabled while live transcription is active.
+A single language selector (Auto-detect plus the supported locales) appears at
+the top; it is disabled while live transcription is active.
 
 ### Live transcription
 
@@ -53,8 +66,9 @@ library (ONNX Runtime Web, v5 model) to detect voice activity locally:
    pulsing dot indicates active speech.
 3. Only frames where speech is detected are forwarded to the server as
    PCM-16 / 16 kHz binary WebSocket frames; silent intervals are dropped.
-4. The server streams back `partial` events (shown in italic grey) and
-   `committed` events (appended to the permanent transcript) in real time.
+4. The server streams back `partial` events carrying the running transcript of
+   the current utterance (shown in italic grey), updated in real time as the
+   model emits tokens.
 5. When the VAD detects that the user has stopped speaking it waits for the
    **commit delay** (configurable slider, 200 – 1 000 ms, default 500 ms) and
    then sends `{type: "end"}` to the server. The server finalises the current
@@ -84,40 +98,36 @@ curl -F file=@sample.wav http://localhost:9000/v1/transcribe/longform
 
 ### WebSocket streaming protocol
 
-Connect to `/v1/transcribe/stream` (optional `?source_lang=…&target_lang=…`).
+Connect to `/v1/transcribe/stream` (optional `?target_lang=…`).
 
 **Client → server**
 
 | Frame | Content |
 | ----- | ------- |
 | Binary | PCM-16 mono 16 kHz audio samples (`Int16Array`) |
-| Text | `{"type": "end"}` — signals end of stream, triggers final commit |
+| Text | `{"type": "end"}` — signals end of stream, triggers the final event |
 
 **Server → client**
 
 | Event type | When emitted |
 | ---------- | ------------ |
-| `partial` | In-progress hypothesis, may still change |
-| `committed` | Stable prefix confirmed across `STREAM_STABLE_ITERS` inference runs |
-| `final` | Last segment after `{"type": "end"}` received |
+| `partial` | The running transcript of the session; replaces the previous partial as it grows |
+| `final` | The complete transcript, emitted once `{"type": "end"}` is received |
 
 All events carry `{type, text, start, id}`.
 
-### Source / target language (model-dependent)
+### Language selection
 
 ```bash
 # transcribe German speech
-curl -F file=@de.wav -F source_lang=de -F target_lang=de \
-  http://localhost:9000/v1/transcribe
-# translate German speech to English
-curl -F file=@de.wav -F source_lang=de -F target_lang=en \
-  http://localhost:9000/v1/transcribe
+curl -F file=@de.wav -F target_lang=de-DE http://localhost:9000/v1/transcribe
+# auto-detect the spoken language (default)
+curl -F file=@any.wav -F target_lang=auto http://localhost:9000/v1/transcribe
 ```
 
-Whether language selection is available is reported by `GET /health`
-(`supports_languages` + `languages` list); the UI shows the pickers only when
-the model supports them. Supplying these fields to a model that does not support
-them returns `400`.
+The supported locales are reported by `GET /health` (`languages` list). Pass a
+BCP-47 locale (e.g. `en-US`, `de-DE`) or `auto`. Supplying an unsupported value
+returns `400`.
 
 ## Quick start (Docker Compose)
 
@@ -200,17 +210,14 @@ deno task dev         # copies VAD assets then starts Vite — http://localhost:
 
 | Variable | Default | Meaning |
 | -------- | ------- | ------- |
-| `MODEL_NAME` | `nvidia/canary-1b-v2` | HuggingFace model ID to load |
+| `MODEL_NAME` | `nvidia/nemotron-3.5-asr-streaming-0.6b` | HuggingFace model ID to load |
 | `NUM_WORKERS` | `0` (one per GPU) | Number of model replicas |
 | `DEVICES` | _(auto)_ | Explicit device list, e.g. `cuda:0,cuda:1` |
 | `MAX_UPLOAD_MB` | `200` | Max batch upload size |
-| `LONGFORM_CONTEXT` | `256` | Local-attention context for long-form mode |
-| `STREAM_MIN_DURATION` | `1.0` | Seconds of audio before first streaming inference |
-| `STREAM_RETRANSCRIBE_INTERVAL` | `0.5` | Min new audio (s) between inference runs |
-| `STREAM_STABLE_WORDS` | `4` | Min prefix length (words) required for a commit |
-| `STREAM_STABLE_ITERS` | `2` | Identical-prefix runs needed before committing |
-| `STREAM_MAX_DURATION` | `30.0` | Hard buffer cap (s) that forces a commit |
-| `STREAM_CONTEXT_DURATION` | `3.0` | Context window (s) prepended to each inference |
+| `ATT_CONTEXT_SIZE` | `56,6` | Streaming look-ahead `[left,right]` in 80 ms frames; right context sets latency (`56,0`≈80 ms … `56,13`≈1.12 s) |
+| `TARGET_LANG` | `auto` | Default language: a BCP-47 locale (e.g. `de-DE`) or `auto` |
+| `STRIP_LANG_TAGS` | `true` | Strip the trailing `<xx-XX>` language tag from output |
+| `ONLINE_NORMALIZATION` | `true` | Per-chunk feature normalization (applied only if the model normalizes input features) |
 | `LOGFIRE_TOKEN` | _(unset)_ | Export traces to Logfire; console-only if unset |
 
 ### Frontend environment variables
@@ -232,8 +239,11 @@ Logfire as well. Set `LOGFIRE_TOKEN` to export to the Logfire backend.
 
 ## Notes
 
-- Each replica is pinned to a GPU and switches to local attention only while
-  serving a long-form request, then restores the default attention config.
+- Each replica is pinned to a GPU. Cache-aware models run in float32 (mixed
+  precision is not currently supported for streaming), so the encoder cache and
+  RNN-T decoding stay in float32.
+- A live WebSocket session holds one replica for its entire duration, so the
+  number of concurrent live sessions is capped at the pool size.
 - GPU assignment in Compose uses `deploy.resources.reservations.devices`; with
   multiple GPUs the default loads one replica per GPU. Set `NUM_WORKERS` to cap
   that.

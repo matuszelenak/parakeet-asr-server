@@ -6,13 +6,11 @@
     transcribe,
     fetchCapabilities,
     VadTranscriber,
-    STREAM_PARAM_DEFAULTS,
     type Mode,
     type TranscriptionResult,
     type LanguageInfo,
     type StreamEvent,
     type LiveState,
-    type StreamParams,
   } from './lib/api'
   import { LANGUAGES, DEFAULT_LANGUAGE } from './lib/languages'
 
@@ -34,9 +32,7 @@
 
   let supportsLanguages = $state(false)
   let languages = $state<LanguageInfo[]>(LANGUAGES)
-  let sourceLang = $state<string>(DEFAULT_LANGUAGE)
-  let targetLang = $state<string>(DEFAULT_LANGUAGE)
-  let isTranslation = $derived(supportsLanguages && sourceLang !== targetLang)
+  let language = $state<string>(DEFAULT_LANGUAGE)
 
   let recorder: Recorder | null = null
   let wavBlob: Blob | null = null
@@ -51,7 +47,6 @@
   let speaking = $state(false)
   let liveState = $state<LiveState>('listening')
   let commitDelay = $state(500)
-  let streamParams = $state<StreamParams>({ ...STREAM_PARAM_DEFAULTS })
   let vadTranscriber: VadTranscriber | null = null
 
   function handleStreamEvent(event: StreamEvent) {
@@ -84,7 +79,7 @@
     vadTranscriber = t
 
     try {
-      await t.start(supportsLanguages ? { sourceLang, targetLang } : {}, commitDelay, streamParams)
+      await t.start(supportsLanguages ? { targetLang: language } : {}, commitDelay)
       streaming = true
     } catch (e) {
       console.log(e)
@@ -185,7 +180,7 @@
     reset()
     busy = true
     try {
-      const options = supportsLanguages ? { sourceLang, targetLang } : {}
+      const options = supportsLanguages ? { targetLang: language } : {}
       result = await transcribe(wavBlob, activeTab as Mode, options)
     } catch (e) {
       error = (e as Error).message
@@ -206,8 +201,8 @@
 
 <main>
   <header>
-    <h1>🦜 Parakeet/Canary ASR</h1>
-    <p>Record or upload audio and transcribe it with NVIDIA Parakeet/Canary.</p>
+    <h1>🎧 Nemotron ASR</h1>
+    <p>Record, upload, or speak live and transcribe it with NVIDIA Nemotron streaming.</p>
   </header>
 
   <section class="card">
@@ -225,26 +220,14 @@
     {#if supportsLanguages}
       <div class="langs">
         <label>
-          <span>Source language</span>
-          <select bind:value={sourceLang} disabled={streaming}>
-            {#each languages as lang (lang.code)}
-              <option value={lang.code}>{lang.name}</option>
-            {/each}
-          </select>
-        </label>
-        <span class="arrow" class:translate={isTranslation}>→</span>
-        <label>
-          <span>Target language</span>
-          <select bind:value={targetLang} disabled={streaming}>
+          <span>Language</span>
+          <select bind:value={language} disabled={streaming}>
             {#each languages as lang (lang.code)}
               <option value={lang.code}>{lang.name}</option>
             {/each}
           </select>
         </label>
       </div>
-      {#if isTranslation}
-        <p class="hint-line">Translating speech from source to target language.</p>
-      {/if}
     {/if}
 
     {#if activeTab === 'live'}
@@ -264,59 +247,6 @@
                bind:value={commitDelay} disabled={streaming} />
         <span class="commit-value">{commitDelay} ms</span>
       </div>
-
-      <details class="advanced" open={false}>
-        <summary class="advanced-toggle">Advanced</summary>
-        <div class="advanced-grid">
-          <label>Min. duration
-            <div class="param-row">
-              <input type="range" min="0.3" max="3" step="0.1"
-                bind:value={streamParams.minDuration} disabled={streaming} />
-              <span>{streamParams.minDuration.toFixed(1)} s</span>
-            </div>
-          </label>
-          <label>Retranscribe every
-            <div class="param-row">
-              <input type="range" min="0.1" max="2" step="0.1"
-                bind:value={streamParams.retranscribeInterval} disabled={streaming} />
-              <span>{streamParams.retranscribeInterval.toFixed(1)} s</span>
-            </div>
-          </label>
-          <label>Stable words
-            <div class="param-row">
-              <input type="range" min="1" max="10" step="1"
-                bind:value={streamParams.stableWords} disabled={streaming} />
-              <span>{streamParams.stableWords}</span>
-            </div>
-          </label>
-          <label>Stable iterations
-            <div class="param-row">
-              <input type="range" min="1" max="5" step="1"
-                bind:value={streamParams.stableIters} disabled={streaming} />
-              <span>{streamParams.stableIters}</span>
-            </div>
-          </label>
-          <label>Max. buffer
-            <div class="param-row">
-              <input type="range" min="5" max="60" step="5"
-                bind:value={streamParams.maxDuration} disabled={streaming} />
-              <span>{streamParams.maxDuration.toFixed(0)} s</span>
-            </div>
-          </label>
-          <label>Context window
-            <div class="param-row">
-              <input type="range" min="0" max="10" step="0.5"
-                bind:value={streamParams.contextDuration} disabled={streaming} />
-              <span>{streamParams.contextDuration.toFixed(1)} s</span>
-            </div>
-          </label>
-          <button class="reset-btn"
-            onclick={() => { streamParams = { ...STREAM_PARAM_DEFAULTS } }}
-            disabled={streaming}>
-            Reset to defaults
-          </button>
-        </div>
-      </details>
 
       {#if streaming || vadLoading}
         <div class="vad-row">
@@ -502,19 +432,6 @@
     border-radius: 8px;
     padding: 0.5rem;
   }
-  .arrow {
-    padding-bottom: 0.5rem;
-    color: #5b6472;
-  }
-  .arrow.translate {
-    color: #5b8cff;
-  }
-  .hint-line {
-    margin: -0.5rem 0 1rem;
-    font-size: 0.8rem;
-    color: #5b8cff;
-  }
-
   .controls {
     display: flex;
     gap: 0.75rem;
@@ -582,82 +499,6 @@
   }
   .error {
     color: #ff8a80;
-  }
-
-  /* ── Advanced collapsible ───────────────────────────────────────────────── */
-  .advanced {
-    margin-top: 0.75rem;
-    border: 1px solid #262b36;
-    border-radius: 8px;
-    overflow: hidden;
-  }
-  .advanced-toggle {
-    display: block;
-    padding: 0.5rem 0.75rem;
-    font-size: 0.82rem;
-    color: #9aa0ad;
-    cursor: pointer;
-    user-select: none;
-    list-style: none;
-  }
-  .advanced-toggle::marker,
-  .advanced-toggle::-webkit-details-marker { display: none; }
-  .advanced-toggle::before {
-    content: '▶ ';
-    font-size: 0.65rem;
-    vertical-align: middle;
-    transition: transform 0.15s;
-    display: inline-block;
-  }
-  details[open] .advanced-toggle::before {
-    transform: rotate(90deg);
-  }
-  .advanced-grid {
-    padding: 0.5rem 0.75rem 0.75rem;
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 0.6rem 1.2rem;
-  }
-  .advanced-grid label {
-    display: flex;
-    flex-direction: column;
-    gap: 0.2rem;
-    font-size: 0.78rem;
-    color: #9aa0ad;
-  }
-  .param-row {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-  }
-  .param-row input[type='range'] {
-    flex: 1;
-    accent-color: #5b8cff;
-    cursor: pointer;
-  }
-  .param-row input[type='range']:disabled {
-    opacity: 0.45;
-    cursor: not-allowed;
-  }
-  .param-row span {
-    min-width: 3.2rem;
-    text-align: right;
-    font-variant-numeric: tabular-nums;
-    color: #e7e9ee;
-    font-size: 0.78rem;
-  }
-  .reset-btn {
-    grid-column: 1 / -1;
-    margin-top: 0.25rem;
-    font-size: 0.78rem;
-    padding: 0.35rem 0.75rem;
-    background: transparent;
-    border-color: #2c323d;
-    color: #9aa0ad;
-  }
-  .reset-btn:hover:not(:disabled) {
-    color: #e7e9ee;
-    border-color: #5b8cff;
   }
 
   /* ── Commit-delay slider ────────────────────────────────────────────────── */

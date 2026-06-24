@@ -10,7 +10,9 @@ services:
       - "9000:9000"
     environment:
       NUM_WORKERS: ${NUM_WORKERS:-}
-      MODEL_NAME: ${MODEL_NAME:-nvidia/canary-1b-v2}
+      MODEL_NAME: ${MODEL_NAME:-nvidia/nemotron-3.5-asr-streaming-0.6b}
+      ATT_CONTEXT_SIZE: ${ATT_CONTEXT_SIZE:-56,6}
+      TARGET_LANG: ${TARGET_LANG:-auto}
       MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-200}
       LOGFIRE_TOKEN: ${LOGFIRE_TOKEN:-}
     volumes:

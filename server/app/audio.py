@@ -1,9 +1,10 @@
 """Audio ingestion: accept arbitrary WAV uploads, normalise to 16 kHz mono.
 
-NeMo's Parakeet models expect 16 kHz mono audio. Uploaded WAV files may use any
-sample rate, bit depth, or channel count, so we decode with libsndfile, downmix
-to mono, resample with torchaudio, and write a temporary 16-bit PCM WAV that the
-model can read.
+The ASR model expects 16 kHz mono audio. Uploaded WAV files may use any sample
+rate, bit depth, or channel count, so we decode with libsndfile, downmix to
+mono, resample with torchaudio, and write a temporary 16-bit PCM WAV that the
+model can read. (Live streaming feeds float32 samples to the model directly and
+does not go through this module.)
 """
 from __future__ import annotations
 
@@ -21,14 +22,6 @@ TARGET_SR = 16_000
 
 class InvalidAudioError(ValueError):
     """Raised when the uploaded bytes cannot be decoded as audio."""
-
-
-def float32_to_wav_path(samples: np.ndarray) -> str:
-    """Write a float32 16 kHz mono array to a temp PCM WAV file and return its path."""
-    fd, path = tempfile.mkstemp(suffix=".wav", prefix="asr_stream_")
-    os.close(fd)
-    sf.write(path, samples, TARGET_SR, subtype="PCM_16")
-    return path
 
 
 def to_wav16k_mono(raw: bytes) -> str:

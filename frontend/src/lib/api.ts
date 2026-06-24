@@ -59,24 +59,6 @@ export interface StreamEvent {
 // State of the live transcription pipeline reported to the UI.
 export type LiveState = 'listening' | 'speaking' | 'committing'
 
-export interface StreamParams {
-  minDuration: number
-  retranscribeInterval: number
-  stableWords: number
-  stableIters: number
-  maxDuration: number
-  contextDuration: number
-}
-
-export const STREAM_PARAM_DEFAULTS: StreamParams = {
-  minDuration: 1.0,
-  retranscribeInterval: 0.5,
-  stableWords: 4,
-  stableIters: 2,
-  maxDuration: 30.0,
-  contextDuration: 3.0,
-}
-
 export async function fetchCapabilities(): Promise<Capabilities> {
   const res = await fetch(`${BASE}/health`)
   if (!res.ok) return { supportsLanguages: false, languages: [] }
@@ -88,7 +70,7 @@ export async function fetchCapabilities(): Promise<Capabilities> {
 }
 
 export interface TranscribeOptions {
-  sourceLang?: string
+  // BCP-47 locale (e.g. "de-DE") or "auto" to auto-detect the language.
   targetLang?: string
 }
 
@@ -102,7 +84,6 @@ export class VadTranscriber {
   private myvad: import('@ricky0123/vad-web').MicVAD | null = null
   private ws: WebSocket | null = null
   private _wsOptions: TranscribeOptions = {}
-  private _streamParams: StreamParams = STREAM_PARAM_DEFAULTS
   private _speaking = false
   private _stopping = false
   private _expectingClose = false
@@ -118,7 +99,6 @@ export class VadTranscriber {
   private async _openWs(): Promise<void> {
     const options = this._wsOptions
     const params = new URLSearchParams()
-    if (options.sourceLang) params.set('source_lang', options.sourceLang)
     if (options.targetLang) params.set('target_lang', options.targetLang)
     const qs = params.toString() ? `?${params}` : ''
     const wsBase = BASE.replace(/^https:/, 'wss:').replace(/^http:/, 'ws:')
@@ -130,19 +110,6 @@ export class VadTranscriber {
       this.ws!.onopen = () => resolve()
       this.ws!.onerror = () => reject(new Error('Could not connect to server'))
     })
-
-    // Send inference parameters as the first frame so the server can apply
-    // them before any audio arrives.
-    const p = this._streamParams
-    this.ws.send(JSON.stringify({
-      type: 'configure',
-      min_duration: p.minDuration,
-      retranscribe_interval: p.retranscribeInterval,
-      stable_words: p.stableWords,
-      stable_iters: p.stableIters,
-      max_duration: p.maxDuration,
-      context_duration: p.contextDuration,
-    }))
 
     this.ws.onmessage = (ev) => {
       try { this.onEvent(JSON.parse(ev.data as string) as StreamEvent) } catch {}
@@ -169,11 +136,9 @@ export class VadTranscriber {
   async start(
     options: TranscribeOptions = {},
     commitDelay = 500,
-    streamParams: StreamParams = STREAM_PARAM_DEFAULTS,
   ): Promise<void> {
     this._stopping = false
     this._wsOptions = options
-    this._streamParams = streamParams
 
     await this._openWs()
     this.onState('listening')
@@ -269,7 +234,6 @@ export async function transcribe(
 
   const form = new FormData()
   form.append('file', wavBlob, 'recording.wav')
-  if (options.sourceLang) form.append('source_lang', options.sourceLang)
   if (options.targetLang) form.append('target_lang', options.targetLang)
 
   const res = await fetch(`${BASE}${path}`, { method: 'POST', body: form })
