@@ -18,3 +18,5 @@ deno.lock
 # Audio scratch
 *.wav
 .idea
+
+server/models

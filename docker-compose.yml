@@ -1,65 +1,65 @@
 services:
-  server:
-    container_name: parakeet-asr-server-api
-    build:
-      context: ./server
-    image: parakeet-asr-server
-    ports:
-      - "9000:9000"
-    environment:
-      NUM_WORKERS: ${NUM_WORKERS:-}
-      MODEL_NAME: ${MODEL_NAME:-nvidia/nemotron-3.5-asr-streaming-0.6b}
-      ATT_CONTEXT_SIZE: ${ATT_CONTEXT_SIZE:-56,6}
-      TARGET_LANG: ${TARGET_LANG:-auto}
-      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-200}
-      LOGFIRE_TOKEN: ${LOGFIRE_TOKEN:-}
-    volumes:
-      - ${HF_HOME:-./server/models}:/cache/hf
-      - ${HF_HOME:-./server/cache}:/cache/torch
-    shm_size: "2gb"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ["1"]
-              capabilities: [gpu]
-    develop:
-      watch:
-        - action: sync+restart
-          path: ./server/app
-          target: /app/app
-        - action: rebuild
-          path: ./server/pyproject.toml
+    server:
+        container_name: parakeet-asr-server-api
+        build:
+            context: ./server
+        image: parakeet-asr-server
+        ports:
+            - "9000:9000"
+        environment:
+            NUM_WORKERS: ${NUM_WORKERS:-}
+            MODEL_NAME: ${MODEL_NAME:-nvidia/nemotron-3.5-asr-streaming-0.6b}
+            ATT_CONTEXT_SIZE: ${ATT_CONTEXT_SIZE:-56,6}
+            TARGET_LANG: ${TARGET_LANG:-auto}
+            MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-200}
+            LOGFIRE_TOKEN: ${LOGFIRE_TOKEN:-}
+        volumes:
+            - ${HF_HOME:-./server/models}:/cache/hf
+            - ${HF_HOME:-./server/cache}:/cache/torch
+        shm_size: "2gb"
+        deploy:
+            resources:
+                reservations:
+                    devices:
+                        - driver: nvidia
+                          device_ids: ["0"]
+                          capabilities: [gpu]
+        develop:
+            watch:
+                - action: sync+restart
+                  path: ./server/app
+                  target: /app/app
+                - action: rebuild
+                  path: ./server/pyproject.toml
 
-  frontend:
-    container_name: parakeet-asr-server-frontend
-    build:
-      context: ./frontend
-      target: dev
-    image: parakeet-asr-frontend
-    ports:
-      - "5173:5173"
-    environment:
-      API_PROXY_TARGET: ${API_PROXY_TARGET:-http://server:9000}
-    depends_on:
-      server:
-        condition: service_healthy
-    develop:
-      watch:
-        - action: sync
-          path: ./frontend/src
-          target: /app/src
-        - action: sync
-          path: ./frontend/index.html
-          target: /app/index.html
-        - action: sync
-          path: ./frontend/vite.config.ts
-          target: /app/vite.config.ts
-        - action: rebuild
-          path: ./frontend/package.json
-        - action: rebuild
-          path: ./frontend/deno.json
+    frontend:
+        container_name: parakeet-asr-server-frontend
+        build:
+            context: ./frontend
+            target: dev
+        image: parakeet-asr-frontend
+        ports:
+            - "5173:5173"
+        environment:
+            API_PROXY_TARGET: ${API_PROXY_TARGET:-http://server:9000}
+        depends_on:
+            server:
+                condition: service_healthy
+        develop:
+            watch:
+                - action: sync
+                  path: ./frontend/src
+                  target: /app/src
+                - action: sync
+                  path: ./frontend/index.html
+                  target: /app/index.html
+                - action: sync
+                  path: ./frontend/vite.config.ts
+                  target: /app/vite.config.ts
+                - action: rebuild
+                  path: ./frontend/package.json
+                - action: rebuild
+                  path: ./frontend/deno.json
 
 volumes:
-  model-cache:
+    model-cache:

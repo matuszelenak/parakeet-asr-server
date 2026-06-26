@@ -5,14 +5,19 @@ Usage:
     python scripts/test_stream.py <audio.wav> [options]
 
 Options:
-    --host WS_URL     WebSocket base URL (default: ws://localhost:9000)
-    --chunk-ms MS     Audio chunk size in milliseconds (default: 500)
-    --realtime        Simulate real-time playback (sleep between chunks)
+    --host WS_URL       WebSocket base URL (default: ws://localhost:9000)
+    --chunk-ms MS       Audio chunk size in milliseconds (default: 500)
+    --realtime          Simulate real-time playback (sleep between chunks)
+    --target-lang LANG  BCP-47 locale to transcribe/translate into, e.g.
+                        de-DE, sk-SK, or "auto" (default: server default)
+    --raw               Print every event on its own line instead of updating
+                        the running partial in place
 
 Requires:
     pip install websockets soundfile numpy
     # torchaudio is only needed when the WAV sample rate is not already 16 kHz
 """
+
 from __future__ import annotations
 
 import argparse
@@ -31,20 +36,22 @@ except ImportError:
 
 SAMPLING_RATE = 16_000
 
+# The streaming endpoint emits two event types:
+#   partial - the running transcript of the session; it *replaces* the previous
+#             partial as it grows (it is not an incremental delta).
+#   final   - the complete transcript, sent once after end-of-stream.
 EVENT_MARKER = {
     "partial": "~",
-    "committed": "+",
     "final": "!",
 }
 
 _YELLOW = "\033[33m"
-_GREEN = "\033[32m"
 _CYAN = "\033[36m"
 _RESET = "\033[0m"
+_CLEAR_EOL = "\033[K"
 
 EVENT_COLOR = {
     "partial": _YELLOW,
-    "committed": _GREEN,
     "final": _CYAN,
 }
 
@@ -67,7 +74,9 @@ def _load_audio(wav_path: Path) -> np.ndarray:
             tensor = torchaudio.functional.resample(tensor, sr, SAMPLING_RATE)
             mono = tensor.squeeze(0).numpy()
         except ImportError:
-            sys.exit("error: torchaudio is required to resample this file — pip install torchaudio")
+            sys.exit(
+                "error: torchaudio is required to resample this file — pip install torchaudio"
+            )
 
     # Guard against values outside [-1, 1] after potential downmix clipping.
     peak = float(np.max(np.abs(mono)))
@@ -82,8 +91,8 @@ async def run(
     host: str,
     chunk_ms: int,
     realtime: bool,
-    source_lang: str | None,
     target_lang: str | None,
+    raw: bool,
 ) -> int:
     mono = _load_audio(wav_path)
     duration = len(mono) / SAMPLING_RATE
@@ -91,21 +100,23 @@ async def run(
     pcm16 = (mono * 32767).clip(-32768, 32767).astype(np.int16)
     chunk_samples = int(SAMPLING_RATE * chunk_ms / 1000)
 
-    params: list[str] = []
-    if source_lang:
-        params.append(f"source_lang={source_lang}")
-    if target_lang:
-        params.append(f"target_lang={target_lang}")
-    qs = ("?" + "&".join(params)) if params else ""
+    qs = f"?target_lang={target_lang}" if target_lang else ""
 
     uri = f"{host.rstrip('/')}/v1/transcribe/stream{qs}"
     print(f"Connecting to {uri}")
-    lang_info = f"  |  {source_lang or 'en'} → {target_lang or source_lang or 'en'}" if (source_lang or target_lang) else ""
-    print(f"Audio: {duration:.1f}s  |  chunk size: {chunk_ms} ms  |  realtime: {realtime}{lang_info}")
+    lang_info = f"  |  target_lang: {target_lang}" if target_lang else ""
+    print(
+        f"Audio: {duration:.1f}s  |  chunk size: {chunk_ms} ms  |  realtime: {realtime}{lang_info}"
+    )
     print()
+
+    # Render mode: with `--raw` each event is logged on its own line; otherwise
+    # the running partial is rewritten in place (it replaces, not appends).
+    live = not raw and sys.stdout.isatty()
 
     try:
         async with websockets.connect(uri) as ws:
+
             async def _send() -> None:
                 for start in range(0, len(pcm16), chunk_samples):
                     chunk = pcm16[start : start + chunk_samples]
@@ -119,25 +130,38 @@ async def run(
             try:
                 while True:
                     try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=60.0)
+                        raw_msg = await asyncio.wait_for(ws.recv(), timeout=60.0)
                     except asyncio.TimeoutError:
-                        print("error: timed out waiting for a server response", file=sys.stderr)
+                        print(
+                            "error: timed out waiting for a server response",
+                            file=sys.stderr,
+                        )
                         return 1
 
-                    event = json.loads(raw)
+                    event = json.loads(raw_msg)
                     ev_type = event.get("type", "?")
                     text = event.get("text", "")
-                    start_s = event.get("start", 0.0)
                     seg_id = event.get("id", 0)
                     marker = EVENT_MARKER.get(ev_type, "?")
                     color = EVENT_COLOR.get(ev_type, "")
 
-                    # if ev_type != 'committed':
-                    #     continue
+                    # print(event)
 
-                    print(
-                        f"{color}[{ev_type:9s}] [{marker}] id={seg_id}  start={start_s:.2f}s  {text!r}{_RESET}"
-                    )
+                    if live and ev_type == "partial":
+                        # Overwrite the current line with the latest running text.
+                        print(
+                            f"\r{color}[~] {text}{_RESET}{_CLEAR_EOL}",
+                            end="",
+                            flush=True,
+                        )
+                    elif live and ev_type == "final":
+                        # Clear the live partial line, then print the final result.
+                        print(f"\r{_CLEAR_EOL}", end="")
+                        print(f"{color}[final] {text!r}{_RESET}")
+                    else:
+                        print(
+                            f"{color}[{ev_type:8s}] [{marker}] id={seg_id}  {text!r}{_RESET}"
+                        )
 
                     if ev_type == "final":
                         break
@@ -176,16 +200,16 @@ def main() -> int:
         help="Sleep between chunks to simulate real-time playback",
     )
     parser.add_argument(
-        "--source-lang",
-        metavar="LANG",
-        default=None,
-        help="Source language code, e.g. sk, de, fr (default: en)",
-    )
-    parser.add_argument(
         "--target-lang",
         metavar="LANG",
         default=None,
-        help="Target language code for translation (default: same as source)",
+        help="BCP-47 locale to transcribe/translate into, e.g. de-DE, sk-SK, "
+        "or 'auto' (default: server default)",
+    )
+    parser.add_argument(
+        "--raw",
+        action="store_true",
+        help="Print every event on its own line instead of updating the partial in place",
     )
     args = parser.parse_args()
 
@@ -193,7 +217,16 @@ def main() -> int:
         print(f"error: file not found: {args.file}", file=sys.stderr)
         return 1
 
-    return asyncio.run(run(args.file, args.host, args.chunk_ms, args.realtime, args.source_lang, args.target_lang))
+    return asyncio.run(
+        run(
+            args.file,
+            args.host,
+            args.chunk_ms,
+            args.realtime,
+            args.target_lang,
+            args.raw,
+        )
+    )
 
 
 if __name__ == "__main__":

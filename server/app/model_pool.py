@@ -22,16 +22,44 @@ thread, and a worker only ever serves one session at a time.
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import tempfile
+import wave
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
 import logfire
+import numpy as np
 import torch
 
 from .config import settings
 
 SAMPLING_RATE = 16_000
+
+
+def _write_prompt_manifest(paths: list[str], lang: str) -> str:
+    """Write a temp NeMo manifest tagging each clip with its language prompt.
+
+    Returns the manifest path; the caller is responsible for deleting it. Each
+    entry carries ``lang`` (the cut's supervision language) and a ``langID``
+    ``prompt_mode`` so the prompt model conditions on ``lang`` deterministically.
+    """
+    fd, manifest_path = tempfile.mkstemp(suffix=".json", prefix="asr_manifest_")
+    with os.fdopen(fd, "w", encoding="utf-8") as fp:
+        for path in paths:
+            with wave.open(path, "rb") as wav:
+                duration = wav.getnframes() / float(wav.getframerate())
+            entry = {
+                "audio_filepath": path,
+                "duration": duration,
+                "text": "",
+                "lang": lang,
+                "prompt_mode": "langID",
+            }
+            fp.write(json.dumps(entry) + "\n")
+    return manifest_path
 
 
 def _extract_text(transcribed_texts: Any) -> str:
@@ -61,109 +89,147 @@ class StreamingSession:
         self.target_lang = target_lang
 
         # Set in _start (all live on the worker's device / thread).
-        self.buffer: Any = None
-        self.streaming_cfg: Any = None
+        self.bufferer: Any = None  # BatchedCacheFeatureBufferer (one slot)
+        self.frame_samples = 0  # audio samples consumed per streaming step
+        self.drop_extra_pre_encoded = 0
         self.cache_last_channel: Any = None
         self.cache_last_time: Any = None
         self.cache_last_channel_len: Any = None
         self.previous_hypotheses: Any = None
         self.pred_out_stream: Any = None
+        self.pending = np.empty(0, dtype=np.float32)  # not-yet-stepped audio tail
         self.step_num = 0
         self.samples_seen = 0
         self._last_text = ""
 
     # ── worker-thread methods ────────────────────────────────────────────────
     def _start(self) -> None:
-        from nemo.collections.asr.parts.utils.streaming_utils import (
-            CacheAwareStreamingAudioBuffer,
+        from nemo.collections.asr.inference.streaming.buffering.cache_feature_bufferer import (
+            BatchedCacheFeatureBufferer,
         )
+        from omegaconf import OmegaConf, open_dict
 
         model = self.worker.model
         self.worker.set_language(self.target_lang)
-        self.buffer = CacheAwareStreamingAudioBuffer(
-            model=model,
-            online_normalization=self.worker.online_normalization,
-            pad_and_drop_preencoded=False,
+
+        # Cache-aware streaming framing, taken from the encoder's own streaming
+        # config. ``chunk_size`` / ``pre_encode_cache_size`` are per-step feature
+        # frame counts (the trailing element is the steady-state value); each
+        # streaming step consumes ``chunk_size`` feature frames of audio and is
+        # given ``pre_encode_cache_size`` extra frames of left look-back.
+        scfg = model.encoder.streaming_cfg
+        chunk_frames = self._steady(scfg.chunk_size)
+        pre_encode = self._steady(scfg.pre_encode_cache_size)
+        self.drop_extra_pre_encoded = self._steady(scfg.drop_extra_pre_encoded)
+
+        window_stride = float(model.cfg.preprocessor.window_stride)
+        chunk_secs = chunk_frames * window_stride
+        buffer_secs = (chunk_frames + pre_encode) * window_stride
+        self.frame_samples = int(round(chunk_secs * SAMPLING_RATE))
+
+        # The bufferer builds its own preprocessor from this config; force the
+        # inference-time settings so features are deterministic per chunk.
+        pre_cfg = OmegaConf.create(OmegaConf.to_container(model.cfg.preprocessor, resolve=True))
+        with open_dict(pre_cfg):
+            pre_cfg.dither = 0.0
+            pre_cfg.pad_to = 0
+        self.bufferer = BatchedCacheFeatureBufferer(
+            num_slots=1,
+            sample_rate=SAMPLING_RATE,
+            buffer_size_in_secs=buffer_secs,
+            chunk_size_in_secs=chunk_secs,
+            preprocessor_cfg=pre_cfg,
+            device=torch.device(self.worker.device),
         )
-        self.streaming_cfg = model.encoder.streaming_cfg
+
         (
             self.cache_last_channel,
             self.cache_last_time,
             self.cache_last_channel_len,
         ) = model.encoder.get_initial_cache_state(batch_size=1)
+        self.pending = np.empty(0, dtype=np.float32)
 
-    def _current_chunk_size(self) -> int:
-        """Chunk size (in feature frames) the next streaming step will consume."""
-        cs = self.streaming_cfg.chunk_size
-        if isinstance(cs, list):
-            return cs[0] if self.buffer.buffer_idx == 0 else cs[1]
-        return cs
+    @staticmethod
+    def _steady(value: Any) -> int:
+        """Return the steady-state value of a per-step streaming-cfg field.
 
-    def _drain(self, final: bool) -> str:
-        """Run streaming steps for every full chunk currently buffered.
-
-        Mid-stream (``final=False``) only complete chunks are processed; a
-        trailing partial chunk is left in the buffer until more audio arrives.
-        At ``final=True`` the remaining tail is flushed and the last step keeps
-        all encoder outputs (so the look-ahead frames are not dropped).
+        These fields are either a scalar or a ``[first_step, steady_state]``
+        list; we drive fixed-size chunks, so the steady-state value applies to
+        every step (the bufferer zero-pads the first chunk's look-back).
         """
+        return int(value[-1] if isinstance(value, (list, tuple)) else value)
+
+    def _step(self, chunk: np.ndarray, valid: int, is_last: bool) -> str:
+        """Run one cache-aware streaming step over a fixed-size audio chunk.
+
+        ``chunk`` has exactly ``frame_samples`` samples (zero-padded when the
+        final chunk is short); ``valid`` is the count of real samples.
+        """
+        from nemo.collections.asr.inference.streaming.framing.request import Frame
+
         model = self.worker.model
-        text = self._last_text
-        while self.buffer.buffer is not None:
-            idx = self.buffer.buffer_idx
-            remaining = self.buffer.buffer.size(-1) - idx
-            if remaining <= 0:
-                break
-            if not final and remaining < self._current_chunk_size():
-                break
+        frame = Frame(
+            samples=torch.from_numpy(chunk),
+            stream_id=0,
+            is_first=(self.step_num == 0),
+            is_last=is_last,
+            length=valid,
+        )
+        # Roll the chunk into the rolling feature buffer (mel features incl. the
+        # pre-encode look-back) for this single stream.
+        feature_buffers, right_paddings = self.bufferer.update([frame])
+        feat = feature_buffers[0].unsqueeze(0).to(self.worker.compute_dtype)
+        feat_len = feat.shape[-1] - int(right_paddings[0])
+        length = torch.tensor([feat_len], device=feat.device)
 
-            try:
-                chunk_audio, chunk_lengths = next(iter(self.buffer))
-            except StopIteration:
-                break
-
-            chunk_audio = chunk_audio.to(self.worker.compute_dtype)
-            keep_all = final and self.buffer.is_buffer_empty()
-            drop = (
-                0
-                if self.step_num == 0
-                else self.streaming_cfg.drop_extra_pre_encoded
+        with torch.inference_mode():
+            (
+                self.pred_out_stream,
+                transcribed_texts,
+                self.cache_last_channel,
+                self.cache_last_time,
+                self.cache_last_channel_len,
+                self.previous_hypotheses,
+            ) = model.conformer_stream_step(
+                processed_signal=feat,
+                processed_signal_length=length,
+                cache_last_channel=self.cache_last_channel,
+                cache_last_time=self.cache_last_time,
+                cache_last_channel_len=self.cache_last_channel_len,
+                keep_all_outputs=is_last,
+                previous_hypotheses=self.previous_hypotheses,
+                previous_pred_out=self.pred_out_stream,
+                drop_extra_pre_encoded=self.drop_extra_pre_encoded,
+                return_transcription=True,
             )
-            with torch.inference_mode():
-                (
-                    self.pred_out_stream,
-                    transcribed_texts,
-                    self.cache_last_channel,
-                    self.cache_last_time,
-                    self.cache_last_channel_len,
-                    self.previous_hypotheses,
-                ) = model.conformer_stream_step(
-                    processed_signal=chunk_audio,
-                    processed_signal_length=chunk_lengths,
-                    cache_last_channel=self.cache_last_channel,
-                    cache_last_time=self.cache_last_time,
-                    cache_last_channel_len=self.cache_last_channel_len,
-                    keep_all_outputs=keep_all,
-                    previous_hypotheses=self.previous_hypotheses,
-                    previous_pred_out=self.pred_out_stream,
-                    drop_extra_pre_encoded=drop,
-                    return_transcription=True,
-                )
-            self.step_num += 1
-            text = _extract_text(transcribed_texts)
+        self.step_num += 1
+        return _extract_text(transcribed_texts)
 
+    def _feed(self, samples) -> str:
+        samples = np.asarray(samples, dtype=np.float32)
+        self.samples_seen += len(samples)
+        self.pending = np.concatenate((self.pending, samples))
+        text = self._last_text
+        # Emit one step per full chunk; keep the trailing remainder for later.
+        while len(self.pending) >= self.frame_samples:
+            chunk = self.pending[: self.frame_samples]
+            self.pending = self.pending[self.frame_samples :]
+            text = self._step(chunk, valid=self.frame_samples, is_last=False)
         self._last_text = text
         return text
 
-    def _feed(self, samples) -> str:
-        self.samples_seen += len(samples)
-        # append_audio preprocesses to mel features and concatenates onto the
-        # rolling feature buffer (on the model device).
-        self.buffer.append_audio(samples)
-        return self._drain(final=False)
-
     def _finish(self) -> str:
-        return self._drain(final=True)
+        # Flush the tail (plus the encoder's look-ahead) in one final step with
+        # keep_all_outputs=True so the trailing frames are not dropped. A full
+        # frame of silence is used when no audio remains.
+        valid = min(len(self.pending), self.frame_samples)
+        chunk = np.zeros(self.frame_samples, dtype=np.float32)
+        if valid > 0:
+            chunk[:valid] = self.pending[:valid]
+        self.pending = np.empty(0, dtype=np.float32)
+        text = self._step(chunk, valid=valid or self.frame_samples, is_last=True)
+        self._last_text = text
+        return text
 
     # ── async wrappers (dispatch to the worker thread) ───────────────────────
     async def _run(self, fn, *args):
@@ -300,11 +366,34 @@ class Worker:
 
     def transcribe(self, paths: list[str], timestamps: bool, target_lang: str) -> list[Any]:
         """Offline transcription. Executes in the worker thread (one at a time)."""
-        self.set_language(target_lang)
-        with torch.inference_mode():
-            return self.model.transcribe(
-                paths, timestamps=timestamps, batch_size=len(paths)
-            )
+        if not self._supports_prompt:
+            with torch.inference_mode():
+                return self.model.transcribe(
+                    paths, timestamps=timestamps, batch_size=len(paths)
+                )
+
+        # The prompt model picks its language prompt per input cut from the
+        # manifest's ``lang`` field. Neither set_inference_prompt nor
+        # transcribe()'s ``target_lang`` kwarg drives the offline dataloader
+        # (its ``default_lang`` is a dead key in NeMo), and plain dict inputs are
+        # rejected — but a single ``.json`` path is read as a manifest, so we
+        # hand transcribe() one we build ourselves:
+        #   lang        -> cut supervision language ('auto' is a valid prompt key
+        #                  for language-agnostic decoding)
+        #   prompt_mode -> 'langID' forces that language deterministically rather
+        #                  than the dataset's default 'unified' mode, which
+        #                  randomly substitutes the 'auto' prompt.
+        manifest_path = _write_prompt_manifest(paths, target_lang)
+        try:
+            with torch.inference_mode():
+                return self.model.transcribe(
+                    [manifest_path], timestamps=timestamps, batch_size=len(paths)
+                )
+        finally:
+            try:
+                os.remove(manifest_path)
+            except OSError:
+                pass
 
 
 class ModelPool:
