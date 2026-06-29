@@ -7,16 +7,22 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, Literal
 
 import logfire
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket
+from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.websockets import WebSocketDisconnect
 
-from .audio import InvalidAudioError, float32_to_wav_path, to_wav16k_mono
+from .audio import (
+    InvalidAudioError,
+    float32_to_wav_path,
+    to_wav16k_mono,
+    wav_duration_seconds,
+)
 from .config import settings
 from .languages import (
     DEFAULT_LANGUAGE,
@@ -34,6 +40,8 @@ from .schemas import (
     StreamEvent,
     TimestampedResponse,
     TranscriptionResponse,
+    VerboseSegment,
+    VerboseTranscriptionResponse,
     WordTimestamp,
 )
 from .streaming import continuous_transcriber
@@ -123,6 +131,137 @@ def _resolve_languages(
     return {"source_lang": src.value, "target_lang": tgt.value}
 
 
+def _parse_language(code: str | None) -> Language | None:
+    """Map an OpenAI ``language`` string (ISO-639-1) to our Language enum.
+
+    Empty/None yields None (use the model default). An unknown code is a 400.
+    """
+    if code is None or code == "":
+        return None
+    try:
+        return Language(code.lower())
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"unsupported language code: {code}"
+        ) from exc
+
+
+def _extract_words(result: Any) -> list[WordTimestamp]:
+    stamps = getattr(result, "timestamp", None) or {}
+    return [
+        WordTimestamp(word=w.get("word", ""), start=w["start"], end=w["end"])
+        for w in stamps.get("word", [])
+    ]
+
+
+def _extract_verbose_segments(result: Any) -> list[VerboseSegment]:
+    stamps = getattr(result, "timestamp", None) or {}
+    return [
+        VerboseSegment(
+            id=i,
+            start=s["start"],
+            end=s["end"],
+            text=s.get("segment", ""),
+        )
+        for i, s in enumerate(stamps.get("segment", []))
+    ]
+
+
+def _format_ts(seconds: float, sep: str) -> str:
+    """Format ``seconds`` as ``HH:MM:SS<sep>mmm`` (sep ``,`` for SRT, ``.`` for VTT)."""
+    ms_total = int(round(max(seconds, 0.0) * 1000))
+    hours, ms_total = divmod(ms_total, 3_600_000)
+    minutes, ms_total = divmod(ms_total, 60_000)
+    secs, millis = divmod(ms_total, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}{sep}{millis:03d}"
+
+
+def _render_srt(segments: list[VerboseSegment]) -> str:
+    blocks = [
+        f"{i}\n{_format_ts(s.start, ',')} --> {_format_ts(s.end, ',')}\n{s.text.strip()}"
+        for i, s in enumerate(segments, start=1)
+    ]
+    return "\n\n".join(blocks) + ("\n" if blocks else "")
+
+
+def _render_vtt(segments: list[VerboseSegment]) -> str:
+    blocks = [
+        f"{_format_ts(s.start, '.')} --> {_format_ts(s.end, '.')}\n{s.text.strip()}"
+        for s in segments
+    ]
+    return "WEBVTT\n\n" + "\n\n".join(blocks) + ("\n" if blocks else "")
+
+
+_RESPONSE_FORMATS = {"json", "text", "srt", "verbose_json", "vtt"}
+
+
+async def _openai_transcribe(
+    *,
+    file: UploadFile,
+    source: Language | None,
+    target: Language | None,
+    response_format: str,
+    timestamp_granularities: list[str],
+    longform: bool,
+    task: Literal["transcribe", "translate"],
+) -> Response:
+    """Shared core for the OpenAI-compatible transcription/translation endpoints."""
+    if response_format not in _RESPONSE_FORMATS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"unsupported response_format '{response_format}'; expected one of "
+                f"{', '.join(sorted(_RESPONSE_FORMATS))}"
+            ),
+        )
+
+    languages = _resolve_languages(source, target)
+    # Word/segment timestamps are needed for verbose_json (and word granularity)
+    # and for the subtitle formats, which are built from segment timing.
+    want_word = "word" in timestamp_granularities
+    want_timestamps = response_format in {"verbose_json", "srt", "vtt"} or want_word
+
+    path = await _read_and_prepare(file)
+    try:
+        duration = wav_duration_seconds(path)
+        results = await pool.transcribe(
+            [path], timestamps=want_timestamps, longform=longform, **languages
+        )
+    finally:
+        _cleanup(path)
+
+    result = results[0]
+    text = _result_text(result)
+
+    if response_format == "text":
+        return PlainTextResponse(text + "\n")
+
+    if response_format in {"srt", "vtt"}:
+        segments = _extract_verbose_segments(result)
+        body = _render_srt(segments) if response_format == "srt" else _render_vtt(segments)
+        return PlainTextResponse(body)
+
+    if response_format == "verbose_json":
+        language = (source or DEFAULT_LANGUAGE).value if languages else "en"
+        payload = VerboseTranscriptionResponse(
+            task=task,
+            language=language,
+            duration=duration,
+            text=text,
+            words=_extract_words(result) if want_word else [],
+            segments=_extract_verbose_segments(result),
+        )
+        return Response(
+            content=payload.model_dump_json(), media_type="application/json"
+        )
+
+    # response_format == "json" (the default)
+    return Response(
+        content=TranscriptionResponse(text=text).model_dump_json(),
+        media_type="application/json",
+    )
+
+
 @app.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
     supports = model_supports_languages(settings.model_name)
@@ -209,6 +348,82 @@ async def transcribe_longform(
     finally:
         _cleanup(path)
     return TranscriptionResponse(text=_result_text(results[0]))
+
+
+@app.post("/v1/audio/transcriptions")
+async def audio_transcriptions(
+    file: UploadFile = File(...),
+    model: str | None = Form(None),
+    language: str | None = Form(None),
+    prompt: str | None = Form(None),
+    response_format: str = Form("json"),
+    temperature: float | None = Form(None),
+    timestamp_granularities: list[str] | None = Form(
+        None, alias="timestamp_granularities[]"
+    ),
+    timestamp_granularities_alt: list[str] | None = Form(
+        None, alias="timestamp_granularities"
+    ),
+    # --- Non-standard extensions (ignored by standard OpenAI clients) ---
+    # ``target_language`` keeps Canary's general source->target translation
+    # available through the transcriptions endpoint; ``longform`` enables
+    # local-attention windowing for very long recordings.
+    target_language: str | None = Form(None),
+    longform: bool = Form(False),
+) -> Response:
+    """OpenAI-compatible transcription endpoint.
+
+    Mirrors ``POST /v1/audio/transcriptions``. The ``model``, ``prompt``, and
+    ``temperature`` fields are accepted for compatibility but not used by the
+    NeMo backend. ``response_format`` selects the body shape (``json``,
+    ``text``, ``verbose_json``, ``srt``, ``vtt``); ``timestamp_granularities[]``
+    (``word`` / ``segment``) controls which timestamps are populated in
+    ``verbose_json``.
+    """
+    source = _parse_language(language)
+    target = _parse_language(target_language) or source
+    granularities = timestamp_granularities or timestamp_granularities_alt or []
+    return await _openai_transcribe(
+        file=file,
+        source=source,
+        target=target,
+        response_format=response_format,
+        timestamp_granularities=granularities,
+        longform=longform,
+        task="transcribe",
+    )
+
+
+@app.post("/v1/audio/translations")
+async def audio_translations(
+    file: UploadFile = File(...),
+    model: str | None = Form(None),
+    prompt: str | None = Form(None),
+    response_format: str = Form("json"),
+    temperature: float | None = Form(None),
+    # --- Non-standard extension ---
+    # OpenAI's translations endpoint always targets English and auto-detects the
+    # source. Canary does not auto-detect, so ``language`` names the source
+    # (default English); the target is always English.
+    language: str | None = Form(None),
+    longform: bool = Form(False),
+) -> Response:
+    """OpenAI-compatible translation endpoint (translates audio into English).
+
+    Mirrors ``POST /v1/audio/translations``. The source language defaults to
+    English and may be set via the non-standard ``language`` field; the target
+    is always English.
+    """
+    source = _parse_language(language) or DEFAULT_LANGUAGE
+    return await _openai_transcribe(
+        file=file,
+        source=source,
+        target=Language.en,
+        response_format=response_format,
+        timestamp_granularities=[],
+        longform=longform,
+        task="translate",
+    )
 
 
 @app.websocket("/v1/transcribe/stream")

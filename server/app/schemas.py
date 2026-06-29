@@ -36,6 +36,38 @@ class TimestampedResponse(BaseModel):
     chars: list[CharTimestamp] = []
 
 
+class VerboseSegment(BaseModel):
+    """A segment in an OpenAI ``verbose_json`` transcription response.
+
+    Only ``id``/``start``/``end``/``text`` carry real data here; the remaining
+    fields (``tokens``, ``avg_logprob``, ...) are part of OpenAI's schema but are
+    not produced by NeMo, so they are emitted with neutral defaults so that
+    standard OpenAI clients can parse the response without error.
+    """
+
+    id: int
+    seek: int = 0
+    start: float
+    end: float
+    text: str
+    tokens: list[int] = []
+    temperature: float = 0.0
+    avg_logprob: float = 0.0
+    compression_ratio: float = 0.0
+    no_speech_prob: float = 0.0
+
+
+class VerboseTranscriptionResponse(BaseModel):
+    """OpenAI ``verbose_json`` response shape for transcriptions/translations."""
+
+    task: Literal["transcribe", "translate"] = "transcribe"
+    language: str
+    duration: float
+    text: str
+    words: list[WordTimestamp] = []
+    segments: list[VerboseSegment] = []
+
+
 class LanguageInfo(BaseModel):
     code: str
     name: str

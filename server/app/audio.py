@@ -31,6 +31,17 @@ def float32_to_wav_path(samples: np.ndarray) -> str:
     return path
 
 
+def wav_duration_seconds(path: str) -> float:
+    """Return the duration in seconds of a WAV file written by this module."""
+    try:
+        info = sf.info(path)
+        if info.samplerate:
+            return float(info.frames) / float(info.samplerate)
+    except Exception:  # pragma: no cover - defensive
+        pass
+    return 0.0
+
+
 def to_wav16k_mono(raw: bytes) -> str:
     """Decode `raw` audio bytes and write a 16 kHz mono PCM WAV to a temp file.
 
