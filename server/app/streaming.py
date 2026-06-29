@@ -227,10 +227,10 @@ async def continuous_transcriber(
             final_words = final_words[1:]
         last_words = final_words
 
-    if last_words:
-        yield StreamEvent(
-            type="final",
-            text=" ".join(w["word"] for w in last_words),
-            start=ts_offset,
-            id=segment_id,
-        )
+    # Always yield final event to signal stream completion
+    yield StreamEvent(
+        type="final",
+        text=" ".join(w["word"] for w in last_words) if last_words else "",
+        start=ts_offset,
+        id=segment_id,
+    )
