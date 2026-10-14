@@ -1,19 +1,19 @@
 [project]
 name = "parakeet-asr-server"
-version = "0.1.0"
-description = "FastAPI server exposing NVIDIA Parakeet/Canary ASR (plain / timestamped / long-form)"
-requires-python = ">=3.10,<3.13"
+version = "0.2.0"
+description = "FastAPI server exposing NVIDIA Parakeet/Canary ASR (OpenAI-compatible, LiteLLM-ready)"
+requires-python = ">=3.12,<3.14"
 dependencies = [
-    "uvicorn[standard]>=0.32",
-    "python-multipart>=0.0.12",
-    "torch==2.11.0",
-    "torchaudio==2.11.0",
-    "nemo-toolkit[asr]>=2.7.3",
-    "fastapi>=0.136.3",
-    "logfire[fastapi]>=4.34.0",
-    "numpy>=1.26.4",
-    "soundfile>=0.13.1",
-    "websockets>=16.0",
+    "fastapi>=0.143.1",
+    "uvicorn[standard]>=0.54.0",
+    "python-multipart>=0.0.32",
+    "torch>=2.12.0",
+    "nemo-toolkit[asr]>=3.0.0",
+    "logfire[fastapi]>=5.2.0",
+    "numpy>=2.5.4",
+    "scipy>=1.16",
+    "soundfile>=0.14.0",
+    "websockets>=17.2",
 ]
 
 [build-system]

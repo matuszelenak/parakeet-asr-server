@@ -10,7 +10,7 @@
 # Then open http://<host>:9000 — UI and API are served from the same origin.
 
 # ---- Stage 1: build the frontend with Deno ----
-FROM denoland/deno:2.8.1 AS frontend
+FROM denoland/deno:2.9.7 AS frontend
 WORKDIR /frontend
 # Install deps first for layer caching.
 COPY frontend/deno.json frontend/package.json ./

@@ -17,10 +17,13 @@ run on a node with NVIDIA GPUs.
 
 - **Three batch transcription modes** — plain text, word/segment/char
   timestamps, and long-form (local-attention windowing for very long recordings).
+- **OpenAI-compatible API** — `/v1/audio/transcriptions`, `/v1/audio/translations`
+  and `/v1/models`, including **SSE streaming** (`stream=true`), so the server
+  can sit behind a [LiteLLM proxy](#litellm-proxy) or be used with any OpenAI SDK.
 - **Live transcription** — real-time streaming transcription over WebSocket,
   driven by client-side Silero VAD so only detected speech reaches the server.
-- **Any audio in** — uploads are decoded, downmixed to mono, and resampled to
-  16 kHz client-side before upload (WAV, WebM/Opus, and most browser formats).
+- **Any audio in** — uploads are decoded (libsndfile, with an ffmpeg fallback
+  for M4A/MP4/WebM/...), downmixed to mono, and resampled to 16 kHz.
 - **Parallel requests** — one model replica is loaded per GPU; requests check
   out an idle replica from a queue, so N requests run concurrently across N GPUs.
 - **Language selection & translation** — models that support it (e.g.
@@ -73,14 +76,113 @@ library (ONNX Runtime Web, v5 model) to detect voice activity locally:
 | `POST` | `/v1/transcribe/timestamps` | Word / segment / char timestamps |
 | `POST` | `/v1/transcribe/longform` | Long-form transcription |
 | `WS`   | `/v1/transcribe/stream` | Real-time streaming transcription |
+| `POST` | `/v1/audio/transcriptions` | OpenAI-compatible transcription (+ SSE streaming) |
+| `POST` | `/v1/audio/translations` | OpenAI-compatible translation to English |
+| `GET`  | `/v1/models` | OpenAI-compatible model list |
 
-`POST` endpoints take `multipart/form-data` with a `file` field (WAV).
+`POST` endpoints take `multipart/form-data` with a `file` field (any common
+audio format).
 
 ```bash
 curl -F file=@sample.wav http://localhost:9000/v1/transcribe
 curl -F file=@sample.wav http://localhost:9000/v1/transcribe/timestamps
 curl -F file=@sample.wav http://localhost:9000/v1/transcribe/longform
 ```
+
+### OpenAI-compatible endpoints
+
+`POST /v1/audio/transcriptions` accepts the standard OpenAI fields:
+
+| Field | Notes |
+| ----- | ----- |
+| `file` | Required. Any format libsndfile or ffmpeg can decode |
+| `model` | Accepted and ignored (the server runs one model) |
+| `language` | ISO-639-1 code (`en`, `sk`, `en-US` is fine). Selects the source language on Canary; ignored on models without language selection |
+| `response_format` | `json` (default), `text`, `verbose_json`, `srt`, `vtt` |
+| `timestamp_granularities[]` | `word` and/or `segment` (for `verbose_json`) |
+| `stream` | `true` → server-sent events (see below) |
+| `prompt`, `temperature` | Accepted and ignored |
+| `target_language` | Extension: translate into this language (Canary) |
+| `longform` | Extension: local-attention mode for very long recordings |
+
+`POST /v1/audio/translations` is the same minus streaming/timestamps, always
+targets English, and takes the source via `language` (default `en`).
+
+Errors on these routes use the OpenAI envelope
+(`{"error": {"message", "type", "param", "code"}}`) so OpenAI SDKs and LiteLLM
+surface the real message.
+
+```bash
+curl http://localhost:9000/v1/audio/transcriptions \
+  -F file=@sample.m4a -F model=parakeet -F language=sk
+```
+
+#### SSE streaming (`stream=true`)
+
+With `stream=true` (and `response_format` `json`/`text`; it is ignored for the
+timestamped formats, as on OpenAI) the response is `text/event-stream` in
+OpenAI's `gpt-4o-transcribe` format:
+
+```
+data: {"type":"transcript.text.delta","delta":"Hello there."}
+
+data: {"type":"transcript.text.delta","delta":" How are you?"}
+
+data: {"type":"transcript.text.done","text":"Hello there. How are you?"}
+```
+
+Parakeet/Canary are not incremental models, so the audio is split into chunks
+of at most `SSE_CHUNK_DURATION` seconds, cut at the quietest point near the
+limit. Each chunk is transcribed in turn and emitted as one delta, so the first
+text arrives after one chunk rather than after the whole file. An error after
+the stream has started is sent as a `data: {"error": {...}}` event, which the
+OpenAI SDKs raise as an exception.
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:9000/v1", api_key="unused")
+with open("sample.wav", "rb") as f:
+    for event in client.audio.transcriptions.create(
+        model="parakeet", file=f, stream=True
+    ):
+        if event.type == "transcript.text.delta":
+            print(event.delta, end="", flush=True)
+```
+
+`scripts/test_sse.py` does the same from the command line.
+
+### LiteLLM proxy
+
+[`litellm/config.yaml`](litellm/config.yaml) is a ready-to-use example. It
+exposes the server in two ways:
+
+1. **As a regular model** (`model_name: parakeet`, provider `openai/` with
+   `api_base` pointing at this server). Clients call LiteLLM's standard
+   `POST /v1/audio/transcriptions` with `model=parakeet` and get keys,
+   budgets, logging, load balancing and health checks (`mode:
+   audio_transcription`). All response formats work. LiteLLM sends
+   `response_format=verbose_json` by default so that it can read `duration`
+   for cost tracking.
+2. **As a pass-through route** (`/parakeet/...` → this server, with LiteLLM
+   key auth). This is how SSE streaming and the native endpoints reach clients
+   through LiteLLM, e.g. `base_url="http://litellm:4000/parakeet/v1"`.
+
+```bash
+litellm --config litellm/config.yaml --port 4000
+curl http://localhost:4000/v1/audio/transcriptions \
+  -H "Authorization: Bearer sk-change-me" -F model=parakeet -F file=@sample.wav
+```
+
+> **Streaming caveat (LiteLLM ≤ 1.105.1, tested):** LiteLLM's own
+> `/v1/audio/transcriptions` route does not stream. It drops `stream` and
+> returns the complete JSON response. Its pass-through route forwards the SSE
+> events intact (the OpenAI SDK's `stream=True` works through it), but for
+> `multipart/form-data` uploads it buffers the upstream response, so all the
+> deltas arrive together when transcription finishes. For truly progressive
+> streaming, call the server directly. The WebSocket live endpoint is not
+> proxied by LiteLLM either; expose it directly or through a plain reverse
+> proxy.
 
 ### WebSocket streaming protocol
 
@@ -211,6 +313,9 @@ deno task dev         # copies VAD assets then starts Vite — http://localhost:
 | `STREAM_STABLE_ITERS` | `2` | Identical-prefix runs needed before committing |
 | `STREAM_MAX_DURATION` | `30.0` | Hard buffer cap (s) that forces a commit |
 | `STREAM_CONTEXT_DURATION` | `3.0` | Context window (s) prepended to each inference |
+| `SERVED_MODEL_NAME` | _(= `MODEL_NAME`)_ | Model id reported by `GET /v1/models` |
+| `SSE_CHUNK_DURATION` | `20.0` | Max audio (s) per chunk/delta for `stream=true` |
+| `SSE_SPLIT_SEARCH` | `4.0` | Window (s) before the chunk limit searched for a quiet cut point |
 | `LOGFIRE_TOKEN` | _(unset)_ | Export traces to Logfire; console-only if unset |
 
 ### Frontend environment variables

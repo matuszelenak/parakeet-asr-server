@@ -104,3 +104,45 @@ class HealthResponse(BaseModel):
     # and the list of supported languages (empty when unsupported).
     supports_languages: bool = False
     languages: list[LanguageInfo] = []
+
+
+class TranscriptTextDeltaEvent(BaseModel):
+    """OpenAI ``transcript.text.delta`` SSE event (``stream=true``)."""
+
+    type: Literal["transcript.text.delta"] = "transcript.text.delta"
+    delta: str
+
+
+class TranscriptTextDoneEvent(BaseModel):
+    """OpenAI ``transcript.text.done`` SSE event; carries the full transcript."""
+
+    type: Literal["transcript.text.done"] = "transcript.text.done"
+    text: str
+
+
+class ModelCard(BaseModel):
+    """An entry of the OpenAI ``GET /v1/models`` listing."""
+
+    id: str
+    object: Literal["model"] = "model"
+    created: int
+    owned_by: str = "nvidia"
+
+
+class ModelList(BaseModel):
+    object: Literal["list"] = "list"
+    data: list[ModelCard]
+
+
+class OpenAIErrorBody(BaseModel):
+    message: str
+    type: str
+    param: str | None = None
+    code: str | None = None
+
+
+class OpenAIError(BaseModel):
+    """OpenAI-style error envelope returned by the ``/v1/audio`` and
+    ``/v1/models`` endpoints, so OpenAI SDKs and LiteLLM surface the message."""
+
+    error: OpenAIErrorBody

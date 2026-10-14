@@ -11,7 +11,7 @@ Options:
 
 Requires:
     pip install websockets soundfile numpy
-    # torchaudio is only needed when the WAV sample rate is not already 16 kHz
+    # scipy is only needed when the WAV sample rate is not already 16 kHz
 """
 from __future__ import annotations
 
@@ -55,19 +55,14 @@ def _load_audio(wav_path: Path) -> np.ndarray:
     mono = data.mean(axis=1)
 
     if sr != SAMPLING_RATE:
-        print(
-            f"warning: resampling from {sr} Hz to {SAMPLING_RATE} Hz (requires torchaudio)",
-            file=sys.stderr,
-        )
         try:
-            import torch
-            import torchaudio
+            from math import gcd
 
-            tensor = torch.from_numpy(mono).unsqueeze(0)
-            tensor = torchaudio.functional.resample(tensor, sr, SAMPLING_RATE)
-            mono = tensor.squeeze(0).numpy()
+            from scipy.signal import resample_poly
         except ImportError:
-            sys.exit("error: torchaudio is required to resample this file — pip install torchaudio")
+            sys.exit("error: scipy is required to resample this file — pip install scipy")
+        g = gcd(sr, SAMPLING_RATE)
+        mono = resample_poly(mono, SAMPLING_RATE // g, sr // g).astype(np.float32)
 
     # Guard against values outside [-1, 1] after potential downmix clipping.
     peak = float(np.max(np.abs(mono)))

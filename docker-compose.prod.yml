@@ -12,6 +12,8 @@ services:
       NUM_WORKERS: ${NUM_WORKERS:-}
       MODEL_NAME: ${MODEL_NAME:-nvidia/canary-1b-v2}
       MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-200}
+      SERVED_MODEL_NAME: ${SERVED_MODEL_NAME:-}
+      SSE_CHUNK_DURATION: ${SSE_CHUNK_DURATION:-20}
       LOGFIRE_TOKEN: ${LOGFIRE_TOKEN:-}
     volumes:
       - ${HF_HOME:-./server/models}:/cache/hf

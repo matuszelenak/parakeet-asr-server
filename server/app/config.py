@@ -27,6 +27,13 @@ class Settings:
     # HuggingFace / NeMo model id to load.
     model_name: str = os.environ.get("MODEL_NAME", "nvidia/canary-1b-v2")
 
+    # Model id reported by the OpenAI-compatible ``/v1/models`` endpoint and in
+    # responses. The ``model`` field of incoming requests is accepted as-is, so
+    # this only matters for clients/proxies (e.g. LiteLLM) that list models.
+    served_model_name: str = os.environ.get("SERVED_MODEL_NAME", "") or os.environ.get(
+        "MODEL_NAME", "nvidia/canary-1b-v2"
+    )
+
     # Number of model replicas. Defaults to one per visible GPU (resolved at
     # startup when this is 0).
     num_workers: int = _int("NUM_WORKERS", 0)
@@ -64,6 +71,14 @@ class Settings:
     # call.  Gives the model acoustic context so it can correctly transcribe the
     # start of each new segment instead of starting cold at a buffer boundary.
     stream_context_duration: float = _float("STREAM_CONTEXT_DURATION", 3.0)
+
+    # --- SSE streaming (POST /v1/audio/transcriptions with stream=true) ---
+    # Uploaded audio is split into chunks of at most this many seconds, each
+    # transcribed in turn and emitted as a ``transcript.text.delta`` event.
+    sse_chunk_duration: float = _float("SSE_CHUNK_DURATION", 20.0)
+    # Chunk boundaries are placed at the quietest point within this many seconds
+    # before the chunk limit, so words are not cut in half.
+    sse_split_search: float = _float("SSE_SPLIT_SEARCH", 4.0)
 
 
 settings = Settings()

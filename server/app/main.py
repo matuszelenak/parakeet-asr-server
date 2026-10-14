@@ -5,21 +5,41 @@ import asyncio
 import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncGenerator, Literal
 
 import logfire
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile, WebSocket
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+    WebSocket,
+)
+from fastapi.exception_handlers import (
+    http_exception_handler,
+    request_validation_exception_handler,
+)
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.websockets import WebSocketDisconnect
+from pydantic import BaseModel
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .audio import (
+    TARGET_SR,
     InvalidAudioError,
+    decode_16k_mono,
     float32_to_wav_path,
+    split_on_silence,
     to_wav16k_mono,
     wav_duration_seconds,
 )
@@ -35,11 +55,17 @@ from .schemas import (
     CharTimestamp,
     HealthResponse,
     LanguageInfo,
+    ModelCard,
+    ModelList,
+    OpenAIError,
+    OpenAIErrorBody,
     SegmentTimestamp,
     StreamConfig,
     StreamEvent,
     TimestampedResponse,
     TranscriptionResponse,
+    TranscriptTextDeltaEvent,
+    TranscriptTextDoneEvent,
     VerboseSegment,
     VerboseTranscriptionResponse,
     WordTimestamp,
@@ -81,8 +107,57 @@ app.add_middleware(
 )
 
 
-async def _read_and_prepare(upload: UploadFile) -> str:
-    """Validate the upload size, decode it, and return a temp 16k mono WAV path."""
+# --- OpenAI-style errors ------------------------------------------------------
+# The OpenAI-compatible routes return ``{"error": {...}}`` bodies (and 400
+# instead of 422 for validation errors) so OpenAI SDKs and LiteLLM surface the
+# real message. The native routes keep FastAPI's ``{"detail": ...}`` shape,
+# which the frontend relies on.
+_OPENAI_PATH_PREFIXES = ("/v1/audio/", "/v1/models")
+
+
+def _is_openai_path(request: Request) -> bool:
+    return request.url.path.startswith(_OPENAI_PATH_PREFIXES)
+
+
+def _openai_error(
+    status_code: int,
+    message: str,
+    *,
+    param: str | None = None,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
+    error = OpenAIError(
+        error=OpenAIErrorBody(
+            message=message,
+            type="invalid_request_error" if status_code < 500 else "server_error",
+            param=param,
+        )
+    )
+    return JSONResponse(error.model_dump(), status_code=status_code, headers=headers)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _http_exception(request: Request, exc: StarletteHTTPException) -> Response:
+    if _is_openai_path(request):
+        return _openai_error(exc.status_code, str(exc.detail), headers=exc.headers)
+    return await http_exception_handler(request, exc)
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_exception(request: Request, exc: RequestValidationError) -> Response:
+    if _is_openai_path(request):
+        errors = exc.errors()
+        first = errors[0] if errors else {}
+        loc = [str(part) for part in first.get("loc", ())[1:]]
+        return _openai_error(
+            400, first.get("msg", "invalid request"), param=".".join(loc) or None
+        )
+    return await request_validation_exception_handler(request, exc)
+
+
+# --- Upload handling ---------------------------------------------------------
+async def _read_upload(upload: UploadFile) -> bytes:
+    """Read an upload, enforcing the size limit."""
     raw = await upload.read()
     max_bytes = settings.max_upload_mb * 1024 * 1024
     if len(raw) > max_bytes:
@@ -92,8 +167,15 @@ async def _read_and_prepare(upload: UploadFile) -> str:
         )
     if not raw:
         raise HTTPException(status_code=400, detail="empty upload")
+    return raw
+
+
+async def _read_and_prepare(upload: UploadFile) -> str:
+    """Validate the upload size, decode it, and return a temp 16k mono WAV path."""
+    raw = await _read_upload(upload)
     try:
-        return to_wav16k_mono(raw)
+        # Decoding/resampling is CPU-bound; keep it off the event loop.
+        return await asyncio.to_thread(to_wav16k_mono, raw)
     except InvalidAudioError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -110,15 +192,20 @@ def _result_text(result: Any) -> str:
 
 
 def _resolve_languages(
-    source_lang: Language | None, target_lang: Language | None
+    source_lang: Language | None,
+    target_lang: Language | None,
+    *,
+    strict: bool = True,
 ) -> dict[str, str]:
     """Validate language args against the configured model's capabilities.
 
     Returns kwargs (``source_lang`` / ``target_lang``) to pass to the model, or
-    an empty dict when the model does not use language selection.
+    an empty dict when the model does not use language selection. With
+    ``strict=False`` languages are silently ignored for such models (OpenAI
+    clients routinely send ``language`` as a hint).
     """
     if not model_supports_languages(settings.model_name):
-        if source_lang is not None or target_lang is not None:
+        if strict and (source_lang is not None or target_lang is not None):
             raise HTTPException(
                 status_code=400,
                 detail="the configured model does not support language selection",
@@ -139,7 +226,8 @@ def _parse_language(code: str | None) -> Language | None:
     if code is None or code == "":
         return None
     try:
-        return Language(code.lower())
+        # Accept BCP-47 style tags such as "en-US" by keeping the language part.
+        return Language(code.split("-")[0].split("_")[0].lower())
     except ValueError as exc:
         raise HTTPException(
             status_code=400, detail=f"unsupported language code: {code}"
@@ -195,17 +283,7 @@ def _render_vtt(segments: list[VerboseSegment]) -> str:
 _RESPONSE_FORMATS = {"json", "text", "srt", "verbose_json", "vtt"}
 
 
-async def _openai_transcribe(
-    *,
-    file: UploadFile,
-    source: Language | None,
-    target: Language | None,
-    response_format: str,
-    timestamp_granularities: list[str],
-    longform: bool,
-    task: Literal["transcribe", "translate"],
-) -> Response:
-    """Shared core for the OpenAI-compatible transcription/translation endpoints."""
+def _check_response_format(response_format: str) -> None:
     if response_format not in _RESPONSE_FORMATS:
         raise HTTPException(
             status_code=400,
@@ -215,7 +293,88 @@ async def _openai_transcribe(
             ),
         )
 
-    languages = _resolve_languages(source, target)
+
+def _sse(event: BaseModel) -> str:
+    return f"data: {event.model_dump_json()}\n\n"
+
+
+async def _openai_transcribe_stream(
+    *, file: UploadFile, languages: dict[str, str], longform: bool
+) -> StreamingResponse:
+    """Server-sent-events variant of the OpenAI transcription endpoint.
+
+    NeMo models are not incremental, so the audio is split into chunks at quiet
+    points (``SSE_CHUNK_DURATION``) and each chunk is transcribed in turn; every
+    chunk's text is emitted as a ``transcript.text.delta`` event, followed by a
+    single ``transcript.text.done`` event with the full transcript. Errors that
+    happen after the stream has started are sent as an ``{"error": {...}}``
+    event, which the OpenAI SDKs raise as an exception.
+    """
+    raw = await _read_upload(file)
+    try:
+        samples = await asyncio.to_thread(decode_16k_mono, raw)
+    except InvalidAudioError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    chunks = split_on_silence(
+        samples, settings.sse_chunk_duration, settings.sse_split_search
+    )
+
+    async def events() -> AsyncGenerator[str, None]:
+        parts: list[str] = []
+        with logfire.span(
+            "transcribe_sse",
+            duration=len(samples) / TARGET_SR,
+            chunks=len(chunks),
+            longform=longform,
+            **languages,
+        ):
+            try:
+                for chunk in chunks:
+                    # Skip slivers too short to contain speech.
+                    if len(chunk) < TARGET_SR // 10:
+                        continue
+                    path = float32_to_wav_path(chunk)
+                    try:
+                        results = await pool.transcribe(
+                            [path], longform=longform, **languages
+                        )
+                    finally:
+                        _cleanup(path)
+                    text = _result_text(results[0]).strip()
+                    if not text:
+                        continue
+                    yield _sse(
+                        TranscriptTextDeltaEvent(delta=f" {text}" if parts else text)
+                    )
+                    parts.append(text)
+            except Exception as exc:
+                logfire.exception("sse transcription failed: {exc}", exc=str(exc))
+                yield _sse(
+                    OpenAIError(
+                        error=OpenAIErrorBody(message=str(exc), type="server_error")
+                    )
+                )
+                return
+            yield _sse(TranscriptTextDoneEvent(text=" ".join(parts)))
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+async def _openai_transcribe(
+    *,
+    file: UploadFile,
+    source: Language | None,
+    languages: dict[str, str],
+    response_format: str,
+    timestamp_granularities: list[str],
+    longform: bool,
+    task: Literal["transcribe", "translate"],
+) -> Response:
+    """Shared core for the OpenAI-compatible transcription/translation endpoints."""
     # Word/segment timestamps are needed for verbose_json (and word granularity)
     # and for the subtitle formats, which are built from segment timing.
     want_word = "word" in timestamp_granularities
@@ -350,6 +509,26 @@ async def transcribe_longform(
     return TranscriptionResponse(text=_result_text(results[0]))
 
 
+_MODEL_CREATED = int(time.time())
+
+
+def _model_card() -> ModelCard:
+    return ModelCard(id=settings.served_model_name, created=_MODEL_CREATED)
+
+
+@app.get("/v1/models", response_model=ModelList)
+async def list_models() -> ModelList:
+    """OpenAI-compatible model listing (the single configured model)."""
+    return ModelList(data=[_model_card()])
+
+
+@app.get("/v1/models/{model_id:path}", response_model=ModelCard)
+async def retrieve_model(model_id: str) -> ModelCard:
+    if model_id not in {settings.served_model_name, settings.model_name}:
+        raise HTTPException(status_code=404, detail=f"model '{model_id}' not found")
+    return _model_card()
+
+
 @app.post("/v1/audio/transcriptions")
 async def audio_transcriptions(
     file: UploadFile = File(...),
@@ -364,6 +543,7 @@ async def audio_transcriptions(
     timestamp_granularities_alt: list[str] | None = Form(
         None, alias="timestamp_granularities"
     ),
+    stream: bool = Form(False),
     # --- Non-standard extensions (ignored by standard OpenAI clients) ---
     # ``target_language`` keeps Canary's general source->target translation
     # available through the transcriptions endpoint; ``longform`` enables
@@ -379,14 +559,28 @@ async def audio_transcriptions(
     ``text``, ``verbose_json``, ``srt``, ``vtt``); ``timestamp_granularities[]``
     (``word`` / ``segment``) controls which timestamps are populated in
     ``verbose_json``.
+
+    ``stream=true`` returns server-sent events (``transcript.text.delta`` /
+    ``transcript.text.done``) like OpenAI's ``gpt-4o-transcribe``. As with
+    OpenAI, streaming applies to the ``json`` and ``text`` formats and is
+    ignored for the timestamped ones.
+
+    ``language`` is ignored (rather than rejected) when the configured model
+    does not support language selection.
     """
+    _check_response_format(response_format)
     source = _parse_language(language)
     target = _parse_language(target_language) or source
+    languages = _resolve_languages(source, target, strict=False)
+    if stream and response_format in {"json", "text"}:
+        return await _openai_transcribe_stream(
+            file=file, languages=languages, longform=longform
+        )
     granularities = timestamp_granularities or timestamp_granularities_alt or []
     return await _openai_transcribe(
         file=file,
         source=source,
-        target=target,
+        languages=languages,
         response_format=response_format,
         timestamp_granularities=granularities,
         longform=longform,
@@ -414,11 +608,12 @@ async def audio_translations(
     English and may be set via the non-standard ``language`` field; the target
     is always English.
     """
+    _check_response_format(response_format)
     source = _parse_language(language) or DEFAULT_LANGUAGE
     return await _openai_transcribe(
         file=file,
         source=source,
-        target=Language.en,
+        languages=_resolve_languages(source, Language.en),
         response_format=response_format,
         timestamp_granularities=[],
         longform=longform,

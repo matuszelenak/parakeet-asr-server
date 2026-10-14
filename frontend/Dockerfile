@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # ---- shared dependency layer ----
-FROM denoland/deno:2.8.1 AS deps
+FROM denoland/deno:2.9.7 AS deps
 WORKDIR /app
 COPY deno.json package.json ./
 # Populates node_modules (nodeModulesDir=auto) for Vite/Svelte.
