@@ -1,25 +1,32 @@
 """Continuous transcription over a live async audio stream.
 
 Parakeet/Canary do not support streaming inference, so this module
-approximates it by repeatedly re-transcribing an accumulating buffer and
-committing the leading word-prefix once it has appeared identically across
-`stable_iters` consecutive inference runs.
+approximates it with *local agreement*: the audio buffer is re-transcribed as
+it grows, and the leading words on which the last ``stable_iters`` hypotheses
+agree are committed.
 
 Key design choices:
-- A look-back context window (``context_duration`` seconds of already-committed
-  audio) is prepended to every inference call so the model never starts cold at
-  a buffer boundary.  This eliminates the class of errors where the first few
-  words of a new segment are mis-transcribed due to missing acoustic context.
-- Re-transcription is rate-limited by ``retranscribe_interval`` to avoid GPU
-  overload on every 250 ms chunk.
-- A hard ``max_duration`` cap forces a commit when the buffer grows too large.
-- Stability detection uses a bounded deque and takes the minimum matching-
-  prefix length across all entries in the window.
+- The whole buffer is re-transcribed on every run (not just the audio after
+  the last commit), so every word is decoded with the full current sentence
+  as context. The buffer is only trimmed once it exceeds ``trim_duration``,
+  and then at the end of the last committed *sentence* (a natural pause),
+  keeping ``context_duration`` seconds before the cut as acoustic context.
+  ``max_duration`` is a hard cap that trims at the last committed word.
+- Already-committed words are removed from each hypothesis by time (words
+  starting before the last commit) and by n-gram overlap with the committed
+  tail, including re-decoded variants of the same word ("andrej"/"andreja").
+- Agreement is checked on normalised words (case- and punctuation-insensitive)
+  so "veľa," vs "veľa." does not hold back a commit.
+- Words ending within ``holdback`` seconds of the buffer end are never
+  committed: they may be only partially spoken, and committing them early is
+  the main source of errors at short re-transcription intervals.
+- Re-transcription is rate-limited by ``retranscribe_interval``.
 """
 from __future__ import annotations
 
-from collections import deque
-from typing import Any, AsyncGenerator, Awaitable, Callable, Deque, List
+import re
+import unicodedata
+from typing import Any, AsyncGenerator, Awaitable, Callable
 
 import numpy as np
 
@@ -27,19 +34,45 @@ from .schemas import StreamEvent
 
 SAMPLING_RATE = 16_000
 
-Word = dict  # {"word": str, "start": float, "end": float}
+Word = dict  # {"word": str, "n": str, "start": float, "end": float}, stream time
+
+_NON_WORD = re.compile(r"[^\w]", re.UNICODE)
+_SENTENCE_END = re.compile(r"[.?!…]['\"»”)]*$")
+
+# A word starting this much before the last commit's end is still treated as
+# already committed (word timestamps are imprecise).
+_DEDUP_TOLERANCE = 0.2
+# Longest committed-tail / hypothesis-head overlap removed, in words.
+_MAX_OVERLAP = 5
 
 
-def _strip_context(
-    all_words: List[Word], ctx_secs: float
-) -> List[Word]:
-    """Remove words that fall entirely inside the context window and shift
-    timestamps so they are relative to the current buffer start (t=0)."""
-    return [
-        {**w, "start": w["start"] - ctx_secs, "end": w["end"] - ctx_secs}
-        for w in all_words
-        if w["end"] > ctx_secs
-    ]
+def _norm(word: str) -> str:
+    return _NON_WORD.sub("", unicodedata.normalize("NFC", word).lower())
+
+
+def _same_word(a: str, b: str) -> bool:
+    """Same normalised word, or a re-decoded variant sharing its stem."""
+    if a == b:
+        return True
+    prefix = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        prefix += 1
+    return prefix >= 3 and prefix >= 0.6 * min(len(a), len(b))
+
+
+def _agreed_prefix(hypotheses: list[list[Word]]) -> int:
+    """Length of the common (normalised) prefix of all hypotheses."""
+    n = min(len(h) for h in hypotheses)
+    i = 0
+    while i < n and all(h[i]["n"] == hypotheses[0][i]["n"] for h in hypotheses[1:]):
+        i += 1
+    return i
+
+
+def _text(words: list[Word]) -> str:
+    return " ".join(w["word"] for w in words)
 
 
 async def continuous_transcriber(
@@ -51,186 +84,145 @@ async def continuous_transcriber(
     stable_words: int,
     stable_iters: int,
     max_duration: float,
-    context_duration: float = 2.0,
+    context_duration: float = 1.5,
+    trim_duration: float = 10.0,
+    holdback: float = 0.0,
 ) -> AsyncGenerator[StreamEvent, None]:
     """Yield StreamEvent objects as speech is transcribed incrementally.
 
     Args:
         transcribe_fn: async callable that accepts a float32 16 kHz mono array
-            and returns a NeMo Hypothesis (or None on error).
+            and returns a NeMo Hypothesis with word timestamps (or None on
+            error).
         audio_chunks: async generator of float32 sample arrays.
         min_duration: seconds of audio required before the first inference.
         retranscribe_interval: minimum seconds of *new* audio required between
             consecutive inference runs.
-        stable_words: minimum prefix length (in words) that must match across
-            ``stable_iters`` runs to trigger a commit.
-        stable_iters: number of consecutive identical-prefix runs needed to
-            commit a segment.
-        max_duration: buffer cap in seconds; triggers a forced commit.
-        context_duration: seconds of previously committed audio to prepend as
-            acoustic context on each inference call (0 disables the feature).
+        stable_words: minimum number of agreed words needed to commit.
+        stable_iters: number of consecutive hypotheses that must agree.
+        max_duration: hard buffer cap in seconds; forces a trim (and a commit,
+            if nothing has been committed in the buffer).
+        context_duration: seconds of already-committed audio kept before a
+            trim point as acoustic context.
+        trim_duration: buffer length after which it is trimmed at the end of
+            the last committed sentence.
+        holdback: words ending within this many seconds of the buffer end are
+            not committed yet.
     """
     buffer = np.empty(0, dtype=np.float32)
-    # Rolling window of recently committed audio used as look-back context.
-    context_audio = np.empty(0, dtype=np.float32)
+    buf_offset = 0.0  # stream time of buffer[0]
+    committed: list[Word] = []
+    commit_end = 0.0  # stream time at which the last committed word ends
+    history: list[list[Word]] = []
+    tail: list[Word] = []  # current uncommitted words
     segment_id = 0
-    ts_offset = 0.0
-    last_committed_word = ""
-
-    history: Deque[List[Word]] = deque(maxlen=stable_iters + 1)
-    last_words: List[Word] = []
-
     samples_at_last_run = 0
+    stable_iters = max(1, stable_iters)
+    stable_words = max(1, stable_words)
     min_samples = int(min_duration * SAMPLING_RATE)
     interval_samples = int(retranscribe_interval * SAMPLING_RATE)
-    max_samples = int(max_duration * SAMPLING_RATE)
-    context_samples = int(context_duration * SAMPLING_RATE)
 
-    def _run_inference_input() -> tuple[np.ndarray, float]:
-        """Return (inference_array, context_seconds) for the current state."""
-        if context_samples > 0 and len(context_audio) > 0:
-            return np.concatenate((context_audio, buffer)), len(context_audio) / SAMPLING_RATE
-        return buffer, 0.0
+    async def hypothesis() -> list[Word]:
+        """Transcribe the buffer; return the uncommitted words (stream time)."""
+        result = await transcribe_fn(buffer)
+        stamps = (getattr(result, "timestamp", None) or {}).get("word", []) if result is not None else []
+        words = [
+            {"word": w["word"], "n": _norm(w["word"]),
+             "start": w["start"] + buf_offset, "end": w["end"] + buf_offset}
+            for w in stamps
+        ]
+        words = [w for w in words if w["start"] >= commit_end - _DEDUP_TOLERANCE]
+        if committed and words:
+            done = [w["n"] for w in committed[-_MAX_OVERLAP:]]
+            head = [w["n"] for w in words]
+            for k in range(min(len(done), len(head)), 0, -1):
+                if all(_same_word(a, b) for a, b in zip(done[-k:], head[:k])):
+                    words = words[k:]
+                    break
+        return words
 
-    def _advance_context(advance: int) -> None:
-        """Roll the context window forward after committing ``advance`` samples."""
-        nonlocal context_audio
-        if context_samples <= 0:
+    def commit(words: list[Word]) -> StreamEvent:
+        nonlocal commit_end, segment_id
+        committed.extend(words)
+        commit_end = words[-1]["end"]
+        event = StreamEvent(type="committed", text=_text(words), start=words[0]["start"], id=segment_id)
+        segment_id += 1
+        return event
+
+    def trim(force: bool) -> None:
+        """Drop audio before the last committed sentence end (or word, if forced)."""
+        nonlocal buffer, buf_offset, samples_at_last_run
+        cut = None
+        for w in reversed(committed):
+            if w["end"] <= buf_offset + context_duration:
+                break
+            if _SENTENCE_END.search(w["word"]):
+                cut = w["end"]
+                break
+        if cut is None and force and committed and committed[-1]["end"] > buf_offset:
+            cut = committed[-1]["end"]
+        if cut is None:
             return
-        committed_chunk = buffer[:advance]
-        combined = np.concatenate((context_audio, committed_chunk))
-        context_audio = combined[-context_samples:] if len(combined) >= context_samples else combined.copy()
+        new_offset = max(buf_offset, cut - context_duration)
+        drop = int(round((new_offset - buf_offset) * SAMPLING_RATE))
+        if drop <= 0:
+            return
+        buffer = buffer[drop:]
+        buf_offset += drop / SAMPLING_RATE
+        samples_at_last_run = max(0, samples_at_last_run - drop)
 
     async for chunk in audio_chunks:
         buffer = np.concatenate((buffer, chunk))
-
-        over_limit = len(buffer) > max_samples
-        enough_new = (len(buffer) - samples_at_last_run) >= interval_samples
-        long_enough = len(buffer) >= min_samples
-
-        if not over_limit and not (long_enough and enough_new):
+        duration = len(buffer) / SAMPLING_RATE
+        over_limit = duration > max_duration
+        if not over_limit and (
+            len(buffer) < min_samples or len(buffer) - samples_at_last_run < interval_samples
+        ):
             continue
 
         # ── Run inference ────────────────────────────────────────────────────
-        inference_input, ctx_secs = _run_inference_input()
         samples_at_last_run = len(buffer)
-        result = await transcribe_fn(inference_input)
-        all_words: List[Word] = (
-            (result.timestamp or {}).get("word", []) if result is not None else []
-        )
+        words = await hypothesis()
+        history = (history + [words])[-stable_iters:]
 
-        # Remove context-window words and re-anchor timestamps to buffer start.
-        words = _strip_context(all_words, ctx_secs)
+        # ── Commit the agreed prefix ─────────────────────────────────────────
+        if len(history) == stable_iters:
+            n = _agreed_prefix(history)
+            edge = buf_offset + duration - holdback
+            while n > 0 and words[n - 1]["end"] > edge:
+                n -= 1
+            if n >= stable_words:
+                yield commit(words[:n])
+                history = [h[n:] for h in history]
+            words = history[-1]
 
-        # Drop the leading boundary duplicate (last word of previous segment
-        # occasionally re-appears as the first word when context is thin).
-        if (
-            words
-            and last_committed_word
-            and words[0]["word"].strip().lower() == last_committed_word.strip().lower()
-        ):
-            words = words[1:]
-
-        last_words = words
-
-        # ── Forced commit (buffer overflow) ──────────────────────────────────
+        # ── Trim the buffer ──────────────────────────────────────────────────
         if over_limit:
-            if words:
-                yield StreamEvent(
-                    type="committed",
-                    text=" ".join(w["word"] for w in words),
-                    start=ts_offset,
-                    id=segment_id,
-                )
-                advance = min(int(words[-1]["end"] * SAMPLING_RATE), len(buffer))
-                last_committed_word = words[-1]["word"]
-            else:
-                advance = min(max_samples // 2, len(buffer))
-
-            _advance_context(advance)
-            buffer = buffer[advance:]
-            ts_offset += advance / SAMPLING_RATE
-            segment_id += 1
-            history.clear()
-            last_words = []
-            samples_at_last_run = len(buffer)
-            continue
-
-        if not words:
-            continue
-
-        history.append(words)
-
-        # ── Stability check ──────────────────────────────────────────────────
-        if len(history) >= stable_iters:
-            recent = list(history)[-stable_iters:]
-            reference = recent[-1]
-
-            max_match = len(reference)
-            for older in recent[:-1]:
-                i = 0
-                while (
-                    i < min(max_match, len(older))
-                    and reference[i]["word"].strip().lower()
-                    == older[i]["word"].strip().lower()
-                ):
-                    i += 1
-                max_match = i
-                if max_match < stable_words:
-                    break
-
-            if max_match >= stable_words:
-                committed = reference[:max_match]
-                yield StreamEvent(
-                    type="committed",
-                    text=" ".join(w["word"] for w in committed),
-                    start=ts_offset,
-                    id=segment_id,
-                )
-                advance = min(int(committed[-1]["end"] * SAMPLING_RATE), len(buffer))
-                _advance_context(advance)
-                ts_offset += advance / SAMPLING_RATE
-                buffer = buffer[advance:]
-                segment_id += 1
-                last_committed_word = committed[-1]["word"]
-                residual = reference[max_match:]
-                history.clear()
-                if residual:
-                    history.append(residual)
-                last_words = residual
-                samples_at_last_run = len(buffer)
-                continue
+            if words and (not committed or committed[-1]["end"] <= buf_offset + context_duration):
+                # Nothing committed in this buffer: force-commit all but the last word.
+                forced = words[:-1] if len(words) > 1 else words
+                yield commit(forced)
+                history = []
+                words = words[len(forced):]
+            trim(force=True)
+        elif duration > trim_duration:
+            trim(force=False)
 
         # ── Partial update ───────────────────────────────────────────────────
-        yield StreamEvent(
-            type="partial",
-            text=" ".join(w["word"] for w in words),
-            start=ts_offset,
-            id=segment_id,
-        )
+        tail = words
+        if tail:
+            yield StreamEvent(type="partial", text=_text(tail), start=tail[0]["start"], id=segment_id)
 
-    # ── Stream ended: emit final ─────────────────────────────────────────────
-    if len(buffer) > 0 and (len(buffer) - samples_at_last_run) >= int(
-        0.1 * SAMPLING_RATE
+    # ── Stream ended: re-transcribe any unseen audio, emit the rest ──────────
+    if len(buffer) >= int(0.1 * SAMPLING_RATE) and (
+        not history or len(buffer) - samples_at_last_run >= int(0.1 * SAMPLING_RATE)
     ):
-        inference_input, ctx_secs = _run_inference_input()
-        result = await transcribe_fn(inference_input)
-        final_words: List[Word] = (
-            (result.timestamp or {}).get("word", []) if result is not None else []
-        )
-        final_words = _strip_context(final_words, ctx_secs)
-        if (
-            final_words
-            and last_committed_word
-            and final_words[0]["word"].strip().lower() == last_committed_word.strip().lower()
-        ):
-            final_words = final_words[1:]
-        last_words = final_words
+        tail = await hypothesis()
 
-    # Always yield final event to signal stream completion
+    # Always yield a final event to signal stream completion
     yield StreamEvent(
         type="final",
-        text=" ".join(w["word"] for w in last_words) if last_words else "",
-        start=ts_offset,
+        text=_text(tail),
+        start=tail[0]["start"] if tail else commit_end,
         id=segment_id,
     )

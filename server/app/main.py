@@ -693,6 +693,8 @@ async def transcribe_stream(
     stable_iters        = cfg.stable_iters        if cfg.stable_iters        is not None else settings.stream_stable_iters
     max_duration        = cfg.max_duration        if cfg.max_duration        is not None else settings.stream_max_duration
     context_duration    = cfg.context_duration    if cfg.context_duration    is not None else settings.stream_context_duration
+    trim_duration       = cfg.trim_duration       if cfg.trim_duration       is not None else settings.stream_trim_duration
+    holdback            = cfg.holdback            if cfg.holdback            is not None else settings.stream_holdback
     # ----------------------------------------------------------------------------
 
     async def _reader() -> None:
@@ -751,6 +753,8 @@ async def transcribe_stream(
                 stable_iters=stable_iters,
                 max_duration=max_duration,
                 context_duration=context_duration,
+                trim_duration=trim_duration,
+                holdback=holdback,
             ):
                 await websocket.send_text(event.model_dump_json())
     except WebSocketDisconnect:

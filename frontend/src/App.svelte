@@ -310,6 +310,20 @@
               <span>{streamParams.contextDuration.toFixed(1)} s</span>
             </div>
           </label>
+          <label>Trim buffer after
+            <div class="param-row">
+              <input type="range" min="4" max="30" step="1"
+                bind:value={streamParams.trimDuration} disabled={streaming} />
+              <span>{streamParams.trimDuration.toFixed(0)} s</span>
+            </div>
+          </label>
+          <label>Hold back
+            <div class="param-row">
+              <input type="range" min="0" max="1.5" step="0.1"
+                bind:value={streamParams.holdback} disabled={streaming} />
+              <span>{streamParams.holdback.toFixed(1)} s</span>
+            </div>
+          </label>
           <button class="reset-btn"
             onclick={() => { streamParams = { ...STREAM_PARAM_DEFAULTS } }}
             disabled={streaming}>

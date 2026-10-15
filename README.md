@@ -200,7 +200,7 @@ Connect to `/v1/transcribe/stream` (optional `?source_lang=…&target_lang=…`)
 | Event type | When emitted |
 | ---------- | ------------ |
 | `partial` | In-progress hypothesis, may still change |
-| `committed` | Stable prefix confirmed across `STREAM_STABLE_ITERS` inference runs |
+| `committed` | Words the last `STREAM_STABLE_ITERS` hypotheses agree on; never revised |
 | `final` | Last segment after `{"type": "end"}` received |
 
 All events carry `{type, text, start, id}`.
@@ -309,10 +309,12 @@ deno task dev         # copies VAD assets then starts Vite — http://localhost:
 | `LONGFORM_CONTEXT` | `256` | Local-attention context for long-form mode |
 | `STREAM_MIN_DURATION` | `1.0` | Seconds of audio before first streaming inference |
 | `STREAM_RETRANSCRIBE_INTERVAL` | `0.5` | Min new audio (s) between inference runs |
-| `STREAM_STABLE_WORDS` | `4` | Min prefix length (words) required for a commit |
-| `STREAM_STABLE_ITERS` | `2` | Identical-prefix runs needed before committing |
-| `STREAM_MAX_DURATION` | `30.0` | Hard buffer cap (s) that forces a commit |
-| `STREAM_CONTEXT_DURATION` | `3.0` | Context window (s) prepended to each inference |
+| `STREAM_STABLE_WORDS` | `1` | Min agreed words required for a commit |
+| `STREAM_STABLE_ITERS` | `2` | Consecutive hypotheses that must agree before committing |
+| `STREAM_MAX_DURATION` | `30.0` | Hard buffer cap (s) that forces a trim/commit |
+| `STREAM_CONTEXT_DURATION` | `1.5` | Committed audio (s) kept before a trim point as context |
+| `STREAM_TRIM_DURATION` | `10.0` | Buffer length (s) after which it is trimmed at the last committed sentence end |
+| `STREAM_HOLDBACK` | `0.0` | Words ending this close (s) to the buffer end are not committed |
 | `SERVED_MODEL_NAME` | _(= `MODEL_NAME`)_ | Model id reported by `GET /v1/models` |
 | `SSE_CHUNK_DURATION` | `20.0` | Max audio (s) per chunk/delta for `stream=true` |
 | `SSE_SPLIT_SEARCH` | `4.0` | Window (s) before the chunk limit searched for a quiet cut point |

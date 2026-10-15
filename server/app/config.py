@@ -61,16 +61,20 @@ class Settings:
     stream_min_duration: float = _float("STREAM_MIN_DURATION", 1.0)
     # Minimum new audio (seconds) that must arrive before re-running inference.
     stream_retranscribe_interval: float = _float("STREAM_RETRANSCRIBE_INTERVAL", 0.5)
-    # Minimum word-prefix length that must match across iterations to count as stable.
-    stream_stable_words: int = _int("STREAM_STABLE_WORDS", 4)
-    # How many consecutive matching iterations are required to commit a segment.
+    # Minimum number of agreed words needed to commit.
+    stream_stable_words: int = _int("STREAM_STABLE_WORDS", 1)
+    # How many consecutive hypotheses must agree on a word prefix to commit it.
     stream_stable_iters: int = _int("STREAM_STABLE_ITERS", 2)
-    # Maximum buffer duration (seconds) before a forced commit, regardless of stability.
+    # Hard buffer cap (seconds): forces a trim, and a commit if nothing agreed.
     stream_max_duration: float = _float("STREAM_MAX_DURATION", 30.0)
-    # Seconds of already-committed audio to prepend as context on each inference
-    # call.  Gives the model acoustic context so it can correctly transcribe the
-    # start of each new segment instead of starting cold at a buffer boundary.
-    stream_context_duration: float = _float("STREAM_CONTEXT_DURATION", 3.0)
+    # Seconds of already-committed audio kept before a trim point, so the model
+    # has acoustic context at the start of the buffer.
+    stream_context_duration: float = _float("STREAM_CONTEXT_DURATION", 1.5)
+    # Buffer length (seconds) after which it is trimmed at the end of the last
+    # committed sentence. Longer = more context per decode but more GPU time.
+    stream_trim_duration: float = _float("STREAM_TRIM_DURATION", 10.0)
+    # Words ending within this many seconds of the buffer end are not committed.
+    stream_holdback: float = _float("STREAM_HOLDBACK", 0.0)
 
     # --- SSE streaming (POST /v1/audio/transcriptions with stream=true) ---
     # Uploaded audio is split into chunks of at most this many seconds, each

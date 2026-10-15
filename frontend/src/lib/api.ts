@@ -56,6 +56,19 @@ export interface StreamEvent {
   id: number
 }
 
+// Frames (32 ms each) buffered while not speaking and flushed when speech
+// starts. VAD fires a few frames into an utterance, so without this the onset
+// of every utterance (and the onset frame itself) would be cut off.
+const PREROLL_FRAMES = 10
+
+function toPcm16(frame: Float32Array): Int16Array<ArrayBuffer> {
+  const i16 = new Int16Array(frame.length)
+  for (let i = 0; i < frame.length; i++) {
+    i16[i] = Math.max(-32768, Math.min(32767, Math.round(frame[i] * 32767)))
+  }
+  return i16
+}
+
 // State of the live transcription pipeline reported to the UI.
 export type LiveState = 'listening' | 'speaking' | 'committing'
 
@@ -66,15 +79,19 @@ export interface StreamParams {
   stableIters: number
   maxDuration: number
   contextDuration: number
+  trimDuration: number
+  holdback: number
 }
 
 export const STREAM_PARAM_DEFAULTS: StreamParams = {
   minDuration: 1.0,
   retranscribeInterval: 0.5,
-  stableWords: 4,
+  stableWords: 1,
   stableIters: 2,
   maxDuration: 30.0,
-  contextDuration: 3.0,
+  contextDuration: 1.5,
+  trimDuration: 10.0,
+  holdback: 0.0,
 }
 
 export async function fetchCapabilities(): Promise<Capabilities> {
@@ -107,6 +124,7 @@ export class VadTranscriber {
   private _stopping = false
   private _expectingClose = false
   private _commitTimer: ReturnType<typeof setTimeout> | null = null
+  private _preroll: Int16Array<ArrayBuffer>[] = []
 
   constructor(
     private readonly onEvent: (event: StreamEvent) => void,
@@ -142,6 +160,8 @@ export class VadTranscriber {
       stable_iters: p.stableIters,
       max_duration: p.maxDuration,
       context_duration: p.contextDuration,
+      trim_duration: p.trimDuration,
+      holdback: p.holdback,
     }))
 
     this.ws.onmessage = (ev) => {
@@ -191,12 +211,12 @@ export class VadTranscriber {
       },
       onFrameProcessed: (probs, frame) => {
         this.onActivity(probs.isSpeech, this._speaking)
+        const pcm = toPcm16(frame)
         if (this._speaking && this.ws?.readyState === WebSocket.OPEN) {
-          const i16 = new Int16Array(frame.length)
-          for (let i = 0; i < frame.length; i++) {
-            i16[i] = Math.max(-32768, Math.min(32767, Math.round(frame[i] * 32767)))
-          }
-          this.ws.send(i16.buffer)
+          this.ws.send(pcm.buffer)
+        } else if (!this._speaking) {
+          this._preroll.push(pcm)
+          if (this._preroll.length > PREROLL_FRAMES) this._preroll.shift()
         }
       },
       onSpeechStart: () => {
@@ -206,6 +226,10 @@ export class VadTranscriber {
           this._commitTimer = null
         }
         this._speaking = true
+        if (this.ws?.readyState === WebSocket.OPEN) {
+          for (const pcm of this._preroll) this.ws.send(pcm.buffer)
+        }
+        this._preroll = []
         this.onActivity(1, true)
         this.onState('speaking')
       },

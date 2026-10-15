@@ -93,6 +93,8 @@ class StreamConfig(BaseModel):
     stable_iters: int | None = None
     max_duration: float | None = None
     context_duration: float | None = None
+    trim_duration: float | None = None
+    holdback: float | None = None
 
 
 class HealthResponse(BaseModel):
