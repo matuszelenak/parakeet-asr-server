@@ -29,6 +29,13 @@ Four mode tabs plus a transcript panel underneath:
 | **Timestamped** | Record or upload → transcript + word/segment timings |
 | **Long form** | Record or upload → long-form transcript |
 
+The panel header names the model this instance serves (`parakeet-ultra`,
+`canary-1b-v2`, …) with its precision, and the browser tab title repeats it —
+two instances on two ports are otherwise indistinguishable. The label comes from
+`GET /health` (`served_model`, falling back to the basename of a local `.nemo`
+path), the tooltip carries the loaded path/id, dtype and live-stream slots, and
+the trailing note reflects whether the model takes language arguments.
+
 Language selectors (source → target, with a swap button) appear at the top when
 the loaded model supports them, and are disabled while live transcription is
 active. The transcript panel shows a word count and offers copy, download

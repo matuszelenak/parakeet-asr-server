@@ -122,7 +122,12 @@ class StreamCapacity(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
+    # What is actually loaded: a HuggingFace id or a local .nemo path.
     model: str
+    # The id advertised by /v1/models (SERVED_MODEL_NAME), which is the friendly
+    # label a UI should show — a .nemo path is not user-facing.
+    served_model: str = ""
+
     workers: int
     ready: bool
     # Whether the configured model accepts source/target language selection,

@@ -45,6 +45,13 @@ export interface LanguageInfo {
 }
 
 export interface Capabilities {
+  // Friendly model label ("parakeet-ultra", "canary-1b-v2"), what is loaded,
+  // the precision actually in use and the live-session limit.
+  model: string
+  loaded: string
+  dtype: string | null
+  matmulPrecision: string | null
+  streamLimit: number | null
   supportsLanguages: boolean
   languages: LanguageInfo[]
 }
@@ -103,7 +110,15 @@ export async function fetchCapabilities(): Promise<Capabilities> {
   const res = await fetch(`${BASE}/health`)
   if (!res.ok) throw new Error(`health check failed (${res.status})`)
   const body = await res.json()
+  const loaded = String(body.model ?? '')
   return {
+    // served_model is what /v1/models advertises; a local .nemo path (the
+    // `model` field) is an operator detail, so only fall back to its basename.
+    model: String(body.served_model || loaded.split('/').pop() || '').replace(/\.nemo$/i, ''),
+    loaded,
+    dtype: body.dtype ?? null,
+    matmulPrecision: body.matmul_precision ?? null,
+    streamLimit: body.stream_capacity?.limit ?? null,
     supportsLanguages: Boolean(body.supports_languages),
     languages: Array.isArray(body.languages) ? body.languages : [],
   }

@@ -181,8 +181,10 @@ Four mode tabs plus a transcript panel:
 
 Audio can be recorded in the browser or dropped onto the drop zone (WAV, MP3,
 M4A, WEBM, …) — everything is decoded, downmixed and resampled to 16 kHz
-client-side before upload. Language selectors appear when the loaded model
-supports them. The transcript panel offers copy, download (`.txt`) and clear.
+client-side before upload. The panel header shows which model the instance
+serves (and the browser tab repeats it), language selectors appear when the
+loaded model supports them, and the transcript panel offers copy, download
+(`.txt`) and clear.
 
 How the live path works internally (VAD gating, commit flow, asset loading):
 **[docs/frontend.md](docs/frontend.md)**.

@@ -91,6 +91,8 @@ kubectl get --raw /api/v1/namespaces/asr/services/asr:9000/proxy/metrics \
 
 ```json
 {
+  "model": "/cache/hf/parakeet-ultra/ultra.nemo",
+  "served_model": "parakeet-ultra",
   "queue": {"pending": 0, "inflight": 1, "capacity": 32},
   "batching": {"window_ms": 20, "max_batch_size": 8, "max_batch_audio_seconds": 240},
   "stream_capacity": {"active": 2, "limit": 10},

@@ -583,6 +583,7 @@ async def health() -> HealthResponse:
     return HealthResponse(
         status="ok" if pool.ready else "loading",
         model=settings.model_path or settings.model_name,
+        served_model=settings.served_model_name,
         workers=pool.size,
         ready=pool.ready,
         supports_languages=supports,

@@ -38,6 +38,11 @@
   let copied = $state(false)
   let backendOffline = $state(false)
 
+  let modelLabel = $state('')
+  let modelLoaded = $state('')
+  let modelDtype = $state<string | null>(null)
+  let streamLimit = $state<number | null>(null)
+
   let supportsLanguages = $state(false)
   let languages = $state<LanguageInfo[]>(LANGUAGES)
   let sourceLang = $state<string>(DEFAULT_LANGUAGE)
@@ -79,6 +84,25 @@
           : 'Listening…',
   )
   let commitPercent = $derived(Math.round(speechProb * 100))
+
+  // Which model this instance serves. Two instances (e.g. Parakeet on :9000 and
+  // Canary on :9001) look identical otherwise, so the name goes in the header
+  // and in the tab title.
+  let modelTitle = $derived(
+    backendOffline
+      ? 'No backend'
+      : modelLabel || 'Detecting model…',
+  )
+  let modelTooltip = $derived(
+    [
+      modelLoaded || modelLabel,
+      modelDtype ? `dtype ${modelDtype}` : null,
+      streamLimit ? `${streamLimit} live stream slots` : null,
+      supportsLanguages ? 'language selection' : 'language auto-detect',
+    ]
+      .filter(Boolean)
+      .join(' · '),
+  )
 
   // Keep the newest words visible while streaming.
   $effect(() => {
@@ -163,6 +187,10 @@
   onMount(async () => {
     try {
       const caps = await fetchCapabilities()
+      modelLabel = caps.model
+      modelLoaded = caps.loaded
+      modelDtype = caps.dtype
+      streamLimit = caps.streamLimit
       supportsLanguages = caps.supportsLanguages
       if (caps.languages.length) languages = caps.languages
     } catch {
@@ -316,6 +344,10 @@
   function probHue(p: number) { return Math.round((1 - p) * 120) }
 </script>
 
+<svelte:head>
+  <title>{modelLabel ? `${modelLabel} — ASR` : 'Parakeet/Canary ASR'}</title>
+</svelte:head>
+
 <div class="shell">
   <h1 class="sr-only">Parakeet / Canary ASR</h1>
 
@@ -328,6 +360,19 @@
     {/if}
 
     <section class="panel">
+      <div class="modelbar">
+        <span class="model-chip" class:offline={backendOffline} title={modelTooltip}>
+          <span class="model-dot" aria-hidden="true"></span>
+          <span class="model-name">{modelTitle}</span>
+          {#if modelDtype}
+            <span class="model-meta">{modelDtype === 'float32' ? 'fp32' : modelDtype}</span>
+          {/if}
+        </span>
+        <span class="model-mode">
+          {supportsLanguages ? 'Language selection' : 'Language auto-detect'}
+        </span>
+      </div>
+
       <div class="modes" role="group" aria-label="Transcription mode">
         {#each TABS as tab (tab.value)}
           <button
@@ -759,6 +804,59 @@
   }
 
   /* ── Mode switcher ──────────────────────────────────────────────────────── */
+  .modelbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    margin-bottom: 0.9rem;
+    flex-wrap: wrap;
+  }
+  .model-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+    max-width: 100%;
+    padding: 0.3rem 0.6rem;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.02);
+    font-size: 0.78rem;
+    color: var(--text);
+    cursor: default;
+  }
+  .model-name {
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .model-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--accent-strong);
+    box-shadow: 0 0 0 3px rgba(139, 155, 255, 0.15);
+    flex: none;
+  }
+  .model-chip.offline .model-dot {
+    background: var(--text-faint);
+    box-shadow: none;
+  }
+  .model-meta {
+    padding: 0.05rem 0.35rem;
+    border-radius: var(--radius-sm);
+    background: rgba(255, 255, 255, 0.05);
+    font-size: 0.7rem;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-faint);
+  }
+  .model-mode {
+    font-size: 0.72rem;
+    color: var(--text-faint);
+  }
+
   .modes {
     display: grid;
     grid-template-columns: repeat(4, 1fr);

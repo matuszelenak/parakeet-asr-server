@@ -6,6 +6,12 @@ All endpoints share one loaded model per replica. `POST` endpoints take
 | Method | Path | Description |
 | ------ | ---- | ----------- |
 | `GET`  | `/health` | Readiness, worker count, model, precision, queue/batch/stream state |
+
+`/health.model` is what is actually loaded (a HuggingFace id or a local `.nemo`
+path — an operator detail), while `/health.served_model` repeats the id that
+`/v1/models` advertises. Client UIs should label themselves with
+`served_model`. Full field list and the metrics on `/metrics`:
+[deployment.md](deployment.md#observability).
 | `GET`  | `/metrics` | Prometheus metrics (see [deployment.md](deployment.md#observability)) |
 | `POST` | `/v1/transcribe` | Plain-text transcription |
 | `POST` | `/v1/transcribe/timestamps` | Word / segment / char timestamps |
