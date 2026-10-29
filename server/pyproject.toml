@@ -1,6 +1,6 @@
 [project]
 name = "parakeet-asr-server"
-version = "0.1.0"
+version = "0.1.1"
 description = "FastAPI server exposing NVIDIA Parakeet/Canary ASR (OpenAI-compatible, LiteLLM-ready)"
 requires-python = ">=3.12,<3.14"
 dependencies = [
