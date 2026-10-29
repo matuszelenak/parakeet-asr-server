@@ -28,7 +28,12 @@ from fastapi.exception_handlers import (
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    PlainTextResponse,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from fastapi.websockets import WebSocketDisconnect
 from pydantic import BaseModel
@@ -1033,6 +1038,54 @@ async def transcribe_stream(
             pass
 
 
+# ── Static frontend ──────────────────────────────────────────────────────────
+# Cache lifetimes by asset class. The Vite bundle has content-hashed names, so
+# it is immutable; the VAD model/runtime are version-named but not hashed, so
+# they get a week; the document itself must stay revalidated so a redeploy is
+# picked up.
+_IMMUTABLE_SUFFIXES = (".js", ".css", ".woff2", ".svg", ".png", ".ico")
+
+
+def _cache_control(path: str) -> str:
+    if path.startswith("assets/") and path.endswith(_IMMUTABLE_SUFFIXES):
+        return "public, max-age=31536000, immutable"
+    if path.endswith((".onnx", ".wasm", ".data")) or path.startswith("vad.worklet"):
+        return "public, max-age=604800"
+    if path.endswith(".html") or path == "":
+        return "no-cache"
+    return "public, max-age=3600"
+
+
+class _FrontendStaticFiles(StaticFiles):
+    """StaticFiles that ships precompressed siblings and cache headers.
+
+    The VAD runtime is a ~14 MB wasm plus a 2 MB onnx model; both are fetched by
+    every client the first time it opens a live session. Compressing them on the
+    fly would burn ~1 s of the single event loop per cold request (and stall the
+    WebSocket streams), so the image build writes ``<asset>.gz`` next to them and
+    this class serves that file when the client accepts gzip.
+    """
+
+    async def get_response(self, path: str, scope: Any):
+        response = await super().get_response(path, scope)
+        origin_path = scope.get("path", "").lstrip("/") or "index.html"
+        headers = {"cache-control": _cache_control(origin_path)}
+        if response.status_code == 200 and not origin_path.endswith(".html"):
+            headers["vary"] = "accept-encoding"
+
+        accept = dict(scope["headers"]).get(b"accept-encoding", b"")
+        if b"gzip" in accept and response.status_code == 200:
+            gzipped = Path(self.directory) / f"{path}.gz"
+            if gzipped.is_file():
+                return FileResponse(
+                    gzipped,
+                    media_type=response.media_type,
+                    headers={**headers, "content-encoding": "gzip"},
+                )
+        response.headers.update(headers)
+        return response
+
+
 # Serve the built frontend as static files when configured (production image).
 # Mounted last so API routes (/v1, /health, /docs, ...) keep precedence; the
 # catch-all only handles the SPA assets and index.html. Disabled in dev (empty
@@ -1041,7 +1094,9 @@ if settings.static_dir:
     _static_path = Path(settings.static_dir)
     if _static_path.is_dir():
         app.mount(
-            "/", StaticFiles(directory=_static_path, html=True), name="frontend"
+            "/",
+            _FrontendStaticFiles(directory=_static_path, html=True),
+            name="frontend",
         )
         logfire.info("serving static frontend from {path}", path=str(_static_path))
     else:

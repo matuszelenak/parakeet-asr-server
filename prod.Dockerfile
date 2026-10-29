@@ -19,6 +19,15 @@ COPY frontend/ ./
 # The bundle calls the API at its own origin (this same server), so there is no
 # API base to bake in. Outputs to /frontend/dist.
 RUN deno task build
+# Precompress the large assets: the Silero VAD runtime is a ~14 MB wasm plus a
+# 2 MB onnx model fetched by every client on its first live session, and gzip
+# takes them to ~5 MB. Doing it here keeps the server from compressing a
+# multi-megabyte body on its single event loop while a live stream is running;
+# app.main._FrontendStaticFiles serves the .gz siblings to clients that accept
+# gzip. -9 because it costs build time, not request time.
+RUN find /frontend/dist -type f \( -name '*.wasm' -o -name '*.onnx' -o -name '*.js' -o -name '*.css' \) \
+        -size +256k -exec gzip -9 -k -f {} + \
+    && ls -l /frontend/dist/*.gz
 
 # ---- Stage 2: assemble the server image ----
 FROM ghcr.io/astral-sh/uv@sha256:929560df6a6231d0509739319bc214aaa1e78838ce1f779b1faeb877c23a50d8
