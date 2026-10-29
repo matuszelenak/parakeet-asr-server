@@ -184,11 +184,8 @@ if settings.metrics_enabled:
         )
 
 
-# --- OpenAI-style errors ------------------------------------------------------
-# The OpenAI-compatible routes return ``{"error": {...}}`` bodies (and 400
-# instead of 422 for validation errors) so OpenAI SDKs and LiteLLM surface the
-# real message. The native routes keep FastAPI's ``{"detail": ...}`` shape,
-# which the frontend relies on.
+# OpenAI-compatible routes return ``{"error": {...}}`` (400 instead of 422) so
+# SDKs surface the message; native routes keep FastAPI's ``{"detail": ...}``.
 _OPENAI_PATH_PREFIXES = ("/v1/audio/", "/v1/models")
 
 
@@ -326,15 +323,10 @@ def _resolve_languages(
     *,
     strict: bool = False,
 ) -> dict[str, str]:
-    """Validate language args against the configured model's capabilities.
+    """Language kwargs for the model, or ``{}`` if it takes none.
 
-    Returns kwargs (``source_lang`` / ``target_lang``) to pass to the model, or
-    an empty dict when the model does not use language selection. Languages are
-    ignored (``strict=False``, the default) for such models: clients — including
-    this project's own UI, scripts and LiteLLM configs — routinely send a
-    language hint, and a model swap to a transducer (e.g. Parakeet, which
-    auto-detects) must not start failing those requests. Pass ``strict=True`` to
-    reject them with 400 instead.
+    Hints are ignored (not rejected) for models without language selection, so a
+    swap to an auto-detecting transducer does not break existing clients.
     """
     if not model_supports_languages(settings.model_name):
         if strict and (source_lang is not None or target_lang is not None):
@@ -480,12 +472,9 @@ async def _openai_transcribe_stream(
                     # Skip slivers too short to contain speech.
                     if len(chunk) < TARGET_SR // 10:
                         continue
-                    # NB: chunks go through a temp WAV rather than the in-memory
-                    # array path. NeMo's tensor dataset frames a given utterance
-                    # slightly differently from its lhotse path (4 of 31 chunks on
-                    # our Slovak sample differed, mixed quality), so this bulk path
-                    # keeps the lhotse behaviour that the accuracy runs validated;
-                    # the ~15 ms/chunk saved is not worth the wobble here.
+                    # Temp WAV, not the array path: NeMo's tensor dataset frames
+                    # audio slightly differently (4/31 chunks differed), see
+                    # docs/pitfalls.md.
                     path = float32_to_wav_path(chunk)
                     try:
                         result = await _run_pool(
@@ -716,10 +705,8 @@ async def audio_transcriptions(
         None, alias="timestamp_granularities"
     ),
     stream: bool = Form(False),
-    # --- Non-standard extensions (ignored by standard OpenAI clients) ---
-    # ``target_language`` keeps Canary's general source->target translation
-    # available through the transcriptions endpoint; ``longform`` enables
-    # local-attention windowing for very long recordings.
+    # Non-standard: ``target_language`` enables translation on Canary, ``longform``
+    # local-attention windowing.
     target_language: str | None = Form(None),
     longform: bool = Form(False),
 ) -> Response:
@@ -767,10 +754,7 @@ async def audio_translations(
     prompt: str | None = Form(None),
     response_format: str = Form("json"),
     temperature: float | None = Form(None),
-    # --- Non-standard extension ---
-    # OpenAI's translations endpoint always targets English and auto-detects the
-    # source. Canary does not auto-detect, so ``language`` names the source
-    # (default English); the target is always English.
+    # Non-standard: Canary cannot auto-detect, so ``language`` names the source.
     language: str | None = Form(None),
     longform: bool = Form(False),
 ) -> Response:
@@ -853,22 +837,15 @@ async def transcribe_stream(
     session_started = time.monotonic()
     session_outcome = "error"
     received_s = 0.0
-    # Backpressure: a client may queue at most this much *unprocessed* audio
-    # (``STREAM_MAX_QUEUE_SECONDS``). Real-time clients never get near it; a
-    # fast-feed client is closed with 1013 and pointed at the SSE endpoint,
-    # because pausing the ASGI receive path would also stall WebSocket control
-    # frames (pings) and make the session look dead.
+    # Backpressure: cap *unprocessed* audio and close with 1013 instead of
+    # pausing the receive path (which would also stall pings).
     max_queued_samples = int(settings.stream_max_queue_seconds * SAMPLING_RATE)
     queued_samples = 0
 
     audio_queue: asyncio.Queue[np.ndarray | None] = asyncio.Queue()
 
-    # --- Read optional per-session configure message ----------------------------
-    # The client MAY send {"type": "configure", ...overrides} as its very first
-    # frame.  We wait up to 2 s; if no text frame arrives (or it isn't a
-    # configure message) we fall through using server defaults.  A binary audio
-    # frame that arrives before any configure message is decoded and queued so
-    # no audio is lost.
+    # Optional first frame: {"type": "configure", ...overrides}. Wait 2 s, then
+    # fall back to server defaults; audio arriving first is queued, not lost.
     cfg = StreamConfig()
     ended_upfront = False
     try:
@@ -1039,11 +1016,8 @@ async def transcribe_stream(
             pass
 
 
-# ── Static frontend ──────────────────────────────────────────────────────────
-# Cache lifetimes by asset class. The Vite bundle has content-hashed names, so
-# it is immutable; the VAD model/runtime are version-named but not hashed, so
-# they get a week; the document itself must stay revalidated so a redeploy is
-# picked up.
+# Cache lifetimes: hashed Vite bundles immutable, VAD runtime a week (names are
+# versioned but not hashed), the document revalidated.
 _IMMUTABLE_SUFFIXES = (".js", ".css", ".woff2", ".svg", ".png", ".ico")
 
 
@@ -1058,13 +1032,10 @@ def _cache_control(path: str) -> str:
 
 
 class _FrontendStaticFiles(StaticFiles):
-    """StaticFiles that ships precompressed siblings and cache headers.
+    """StaticFiles with cache headers that serves build-time ``.gz`` siblings.
 
-    The VAD runtime is a ~14 MB wasm plus a 2 MB onnx model; both are fetched by
-    every client the first time it opens a live session. Compressing them on the
-    fly would burn ~1 s of the single event loop per cold request (and stall the
-    WebSocket streams), so the image build writes ``<asset>.gz`` next to them and
-    this class serves that file when the client accepts gzip.
+    Compressing the 14 MB VAD wasm per request would stall the event loop, so
+    the image build precompresses it (see prod.Dockerfile).
     """
 
     async def get_response(self, path: str, scope: Any):
@@ -1087,10 +1058,7 @@ class _FrontendStaticFiles(StaticFiles):
         return response
 
 
-# Serve the built frontend as static files when configured (production image).
-# Mounted last so API routes (/v1, /health, /docs, ...) keep precedence; the
-# catch-all only handles the SPA assets and index.html. Disabled in dev (empty
-# STATIC_DIR), where the Vite dev server serves the UI instead.
+# Mounted last so API routes keep precedence; disabled when STATIC_DIR is empty.
 if settings.static_dir:
     _static_path = Path(settings.static_dir)
     if _static_path.is_dir():

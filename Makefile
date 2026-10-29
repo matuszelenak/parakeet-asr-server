@@ -1,21 +1,11 @@
-# Parakeet ASR server — deployment recipes.
+# Parakeet ASR server — one production image, one or two instances.
 #
-# Two independent instances from one production image (UI + API bundled, served
-# on a single port each):
+#   make run-parakeet      # Parakeet Ultra, GPU 0 -> :9000
+#   make run-canary        # Canary 1B v2,   GPU 1 -> :9001
+#   GPU=2 make run-canary  # explicit GPU wins
 #
-#   make run-parakeet            # Parakeet Ultra, GPU 0 -> http://localhost:9000
-#   make run-canary              # Canary 1B v2,   GPU 1 -> http://localhost:9001
-#   make run-both                # both, GPU_PARAKEET=0 / GPU_CANARY=1
-#   GPU=2 make run-canary        # explicit GPU always wins
-#
-# Each instance has its own env profile (.env.parakeet / .env.canary) and its own
-# compose project (`asr-parakeet`, `asr-canary`), so they can run at the same
-# time without touching each other. Model, precision, streaming tuning, port and
-# container name all live in the profile; only the GPU is chosen per invocation
-# (`GPU=n`, else the per-instance GPU_PARAKEET / GPU_CANARY default).
-#
-# Other useful targets: build, ps, status, logs-<instance>, stop-<instance>,
-# stop-all, dev-down. `make` alone prints this list.
+# Each instance has its own profile (.env.<instance>) and compose project, so
+# they coexist. Details: docs/deployment.md. `make` lists all targets.
 
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
@@ -24,10 +14,8 @@ COMPOSE_FILE := docker-compose.prod.yml
 INSTANCES    := parakeet canary
 
 # --- tunables ----------------------------------------------------------------
-# An explicit `GPU=<n>` wins; otherwise each instance has its own default, so a
-# bare `make run-canary` can never land on the GPU the parakeet instance uses
-# (compose would happily recreate it there — the container would then share or
-# contend for memory instead of failing).
+# Per-instance GPU defaults, so a bare `make run-canary` cannot land on the
+# parakeet GPU (compose would recreate the container there instead of failing).
 GPU_PARAKEET ?= 0
 GPU_CANARY   ?= 1
 HEALTH_TIMEOUT_S ?= 420

@@ -18,12 +18,9 @@ function apiTarget(): string {
 
 const target = apiTarget()
 
-// onnxruntime-web loads its thread-worker module via a dynamic import / Worker
-// constructor at runtime. Putting it in public/ would cause Vite to block the
-// ES-module import with "should not be imported from source code". This plugin
-// intercepts those requests *before* Vite's module transformer and serves the
-// file directly with the correct MIME type.  It also emits the file into the
-// production build so the static server can find it.
+// onnxruntime-web imports its thread-worker module at runtime; Vite would block
+// that import ("should not be imported from source code"), so this plugin serves
+// the file before transformation and emits it into the build.
 function ortThreadWorkerPlugin(): Plugin {
   const fileName = 'ort-wasm-simd-threaded.mjs'
   const src = resolve(process.cwd(), 'node_modules/onnxruntime-web/dist', fileName)

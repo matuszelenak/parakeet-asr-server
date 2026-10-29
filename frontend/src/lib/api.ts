@@ -1,7 +1,5 @@
-// By default, the API is assumed to live at the same address the frontend was
-// opened from (same protocol/host/port). Requests are routed to the backend by
-// a same-origin proxy: the Vite dev server in development.
-// Set VITE_API_BASE to point at a different origin if you are not proxying.
+// Same origin as the page by default (dev: via the Vite proxy).
+// VITE_API_BASE points the browser at a different origin.
 const configured = import.meta.env.VITE_API_BASE
 const BASE =
   configured && configured.length > 0 ? configured : window.location.origin
@@ -129,19 +127,12 @@ export interface TranscribeOptions {
   targetLang?: string
 }
 
-// VAD gates the microphone so only speech frames reach the server.
-// The WebSocket streaming endpoint drives real-time partial→committed transcription.
-// After the user stops speaking a configurable delay elapses, then {type:'end'} is
-// sent which causes the server to finalise the current segment and close the
-// connection. The class then reopens the WebSocket automatically for the next
-// utterance.
-// The live path pulls the Silero VAD runtime from this origin: a ~14 MB wasm
-// build of onnxruntime plus a 2 MB onnx model (names kept in sync with the
-// "copy-assets" task in deno.json). Fetching them only when the user hits the
-// mic makes the whole download feel like a stall, so start it as soon as the
-// live tab is opened — by the time the mic is clicked they are in the HTTP
-// cache (the server serves them precompressed and with a week of
-// Cache-Control, see app/main.py).
+// VAD gates the mic, so only speech frames are sent. After the user stops
+// speaking a commit delay elapses, {type:'end'} finalises the segment and the
+// class reopens the socket for the next utterance.
+//
+// The VAD runtime (~16 MB, names kept in sync with the "copy-assets" task) is
+// prefetched when the Live tab opens rather than on the mic click.
 const VAD_ASSETS = [
   '/silero_vad_v5.onnx',
   '/vad.worklet.bundle.min.js',

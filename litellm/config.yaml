@@ -1,15 +1,10 @@
-# Example LiteLLM proxy config for the Parakeet ASR server.
-#
+# Example LiteLLM proxy config for this ASR server:
 #   litellm --config litellm/config.yaml --port 4000
-#
-# Replace http://parakeet-asr:9000 with the address LiteLLM can reach the ASR
-# server at (e.g. the compose service name, or http://localhost:9000).
+# Replace http://parakeet-asr:9000 with an address LiteLLM can reach.
 
 model_list:
-  # Standard OpenAI route: POST /v1/audio/transcriptions with model=parakeet.
-  # The "openai/" prefix makes LiteLLM treat the server as a generic
-  # OpenAI-compatible backend; everything after it is sent upstream as the
-  # `model` field (the ASR server accepts any value).
+  # The "openai/" prefix selects the OpenAI-compatible backend; the rest is sent
+  # upstream as `model`, which this server ignores.
   - model_name: parakeet
     litellm_params:
       model: openai/nvidia/canary-1b-v2
@@ -21,9 +16,8 @@ model_list:
 general_settings:
   master_key: sk-change-me
 
-  # LiteLLM's /v1/audio/transcriptions route always returns a complete
-  # (non-streamed) response, so SSE streaming (stream=true) and the native
-  # endpoints are exposed through an authenticated pass-through route instead:
+  # LiteLLM's audio route cannot stream, so SSE (stream=true) and the native
+  # endpoints go through an authenticated pass-through instead:
   #   POST {litellm}/parakeet/v1/audio/transcriptions  (stream=true supported)
   #   POST {litellm}/parakeet/v1/transcribe/timestamps
   pass_through_endpoints:

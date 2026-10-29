@@ -34,99 +34,74 @@ class Settings:
     # HuggingFace / NeMo model id to load.
     model_name: str = os.environ.get("MODEL_NAME", "nvidia/canary-1b-v2")
 
-    # Model id reported by the OpenAI-compatible ``/v1/models`` endpoint and in
-    # responses. The ``model`` field of incoming requests is accepted as-is, so
-    # this only matters for clients/proxies (e.g. LiteLLM) that list models.
+    # Id advertised by ``/v1/models`` (incoming ``model`` fields are ignored).
     served_model_name: str = os.environ.get("SERVED_MODEL_NAME", "") or os.environ.get(
         "MODEL_NAME", "nvidia/canary-1b-v2"
     )
 
-    # Number of model replicas. Defaults to one per visible GPU (resolved at
-    # startup when this is 0).
+    # Model replicas; 0 = one per visible GPU (resolved at startup).
     num_workers: int = _int("NUM_WORKERS", 0)
 
-    # Explicit device list, e.g. "cuda:0,cuda:1". When unset, devices are
-    # assigned round-robin across the visible GPUs.
+    # Explicit devices, e.g. "cuda:0,cuda:1"; unset = round-robin over GPUs.
     devices: list[str] | None = field(default_factory=lambda: _csv("DEVICES"))
 
-    # Inference precision for the model weights. ``auto`` picks bfloat16 on
-    # Ampere-and-newer GPUs (compute capability >= 8.0) and float32 elsewhere.
-    # bf16 is ~3x faster than fp32 for this model at batch/stream sizes we use
-    # and left the transcript quality unchanged in our Slovak evaluation
-    # (WER 11.45 % -> 11.26 % long-form, 10.97 % -> 10.79 % plain).
+    # auto = bf16 on Ampere+ (compute capability >= 8.0), else fp32.
+    # bf16 is ~3x faster but degrades transducer models - see docs/benchmarks.md.
     torch_dtype: str = os.environ.get("TORCH_DTYPE", "auto").strip().lower()
 
-    # fp32 matmul/conv precision: ``high`` enables TF32 tensor cores (Ampere+),
-    # which is byte-identical output for this model and ~1.9x faster than the
-    # default ``highest``. ``medium`` (bf16 matmuls in fp32 tensors) is faster
-    # still but changes the numerics.
+    # high = TF32 tensor cores (byte-identical, ~1.9x); medium = bf16 matmuls.
     matmul_precision: str = os.environ.get("MATMUL_PRECISION", "high").strip().lower()
 
     # Largest upload accepted, in megabytes.
     max_upload_mb: int = _int("MAX_UPLOAD_MB", 200)
 
-    # Default source/target language for models that take language arguments
-    # (Canary). Canary defaults to en->en, which *translates* non-English audio
-    # into English; a Slovak deployment wants e.g. DEFAULT_SOURCE_LANG=sk so a
-    # request without language fields transcribes instead of translating.
-    # Leave empty to keep the model default (en).
+    # Defaults for models that take language arguments (Canary). Empty = the
+    # model default en->en, which translates rather than transcribes.
     default_source_lang: str = os.environ.get("DEFAULT_SOURCE_LANG", "").strip().lower()
     default_target_lang: str = os.environ.get("DEFAULT_TARGET_LANG", "").strip().lower()
 
-    # Local ``.nemo`` checkpoint to load instead of a HuggingFace/NGC model id
-    # (e.g. /cache/hf/parakeet-ultra/ultra.nemo). When set, MODEL_NAME is
-    # ignored for loading and only used as the model label.
+    # Local ``.nemo`` to load instead of MODEL_NAME (which becomes a label).
     model_path: str = os.environ.get("MODEL_PATH", "").strip()
 
     # Local-attention context window used for long-form transcription.
     longform_context: int = _int("LONGFORM_CONTEXT", 256)
 
-    # Directory of a built frontend to serve as static files. Empty (the dev
-    # default) disables static serving so the Vite dev server handles the UI.
-    # The production image sets this to the baked-in build (e.g. /app/static).
+    # Built frontend to serve; empty = no static serving (Vite handles the UI).
     static_dir: str = os.environ.get("STATIC_DIR", "")
 
     host: str = os.environ.get("HOST", "0.0.0.0")
     port: int = _int("PORT", 8000)
 
     # --- Batching scheduler -------------------------------------------------
-    # How long the scheduler waits for more requests before starting a batch.
-    # 0 disables batching (one request per model call, the pre-scheduler
-    # behaviour); larger values improve throughput at the cost of latency.
+    # How long to wait for more requests before decoding a batch (0 = no batch).
     batch_window_ms: int = _int("BATCH_WINDOW_MS", 20)
-    # Maximum number of requests decoded together in one model call.
+    # Max requests decoded in one model call.
     max_batch_size: int = _int("MAX_BATCH_SIZE", 8)
-    # Maximum total audio (seconds) in one batch. Keeps VRAM bounded.
+    # Max total audio (s) per batch; keeps VRAM bounded.
     max_batch_audio_seconds: float = _float("MAX_BATCH_AUDIO_SECONDS", 240.0)
-    # Requests longer than this always run on their own (long audio is chunked
-    # internally by NeMo and would otherwise pad every batch neighbour).
+    # Longer requests run alone (NeMo chunks them and they would pad neighbours).
     max_batch_item_seconds: float = _float("MAX_BATCH_ITEM_SECONDS", 30.0)
-    # Audio up to this many seconds is handed to the model as an in-memory
-    # float32 array instead of a temporary WAV file (saves a write + read per
-    # inference; measured ~16 % of a streaming inference). Longer audio still
-    # goes through a temp file so NeMo's chunked long-form decoding applies.
+    # Up to this length, audio goes to the model as an array instead of a temp
+    # WAV; longer audio needs the file path for NeMo's chunked decoding.
     inline_audio_max_seconds: float = _float("INLINE_AUDIO_MAX_SECONDS", 30.0)
-    # Max duration ratio inside a batch (longest / shortest). Padding a short clip
-    # up to a much longer neighbour changes its tail transcript, so mismatched
-    # lengths are decoded in separate batches. 0 disables the check.
+    # Max longest/shortest ratio in a batch: padding to a much longer neighbour
+    # can change a clip's tail. 0 disables the check.
     batch_duration_ratio: float = _float("BATCH_DURATION_RATIO", 2.0)
 
     # --- Admission control --------------------------------------------------
-    # Maximum number of queued (not yet running) requests. 0 disables the limit.
+    # Queued requests before 503; 0 = unlimited.
     max_queue_size: int = _int("MAX_QUEUE_SIZE", 32)
-    # How long a request may wait for a free model before it is rejected.
+    # Max time a request may wait in the queue.
     queue_timeout_s: float = _float("QUEUE_TIMEOUT_S", 120.0)
-    # Value of the ``Retry-After`` header sent with 503 responses.
+    # ``Retry-After`` value sent with 503.
     retry_after_s: int = _int("RETRY_AFTER_S", 2)
 
     # --- Live streaming limits ---------------------------------------------
-    # Maximum number of concurrent WebSocket sessions per replica. ``0`` means
-    # auto: 8 when the replica runs in bf16/fp16, 4 in fp32 (measured on an
-    # RTX 3090 with batching: 12 sessions keep real time in bf16).
+    # Concurrent WebSocket sessions; 0 = 8 in bf16/fp16, 4 in fp32.
     max_concurrent_streams: int = _int("MAX_CONCURRENT_STREAMS", 0)
-    # Maximum audio a client may have queued ahead of the model (seconds).
+    # Unprocessed audio a client may queue before the session is closed.
     stream_max_queue_seconds: float = _float("STREAM_MAX_QUEUE_SECONDS", 120.0)
-    # Hard limit on a single WebSocket session (seconds).
+    # Hard limit on one WebSocket session.
     stream_max_session_seconds: float = _float("STREAM_MAX_SESSION_SECONDS", 3600.0)
 
     # --- Observability ------------------------------------------------------
@@ -134,31 +109,27 @@ class Settings:
     metrics_enabled: bool = _bool("METRICS_ENABLED", True)
 
     # --- Streaming transcription ---
-    # Minimum audio duration (seconds) before the first inference run.
+    # Audio needed before the first inference.
     stream_min_duration: float = _float("STREAM_MIN_DURATION", 1.0)
-    # Minimum new audio (seconds) that must arrive before re-running inference.
+    # New audio needed between inference runs.
     stream_retranscribe_interval: float = _float("STREAM_RETRANSCRIBE_INTERVAL", 0.5)
-    # Minimum number of agreed words needed to commit.
+    # Agreed words required for a commit.
     stream_stable_words: int = _int("STREAM_STABLE_WORDS", 1)
-    # How many consecutive hypotheses must agree on a word prefix to commit it.
+    # Consecutive agreeing hypotheses required for a commit.
     stream_stable_iters: int = _int("STREAM_STABLE_ITERS", 2)
-    # Hard buffer cap (seconds): forces a trim, and a commit if nothing agreed.
+    # Buffer cap: forces a trim, and a commit if nothing agreed.
     stream_max_duration: float = _float("STREAM_MAX_DURATION", 30.0)
-    # Seconds of already-committed audio kept before a trim point, so the model
-    # has acoustic context at the start of the buffer.
+    # Committed audio kept before a trim point as acoustic context.
     stream_context_duration: float = _float("STREAM_CONTEXT_DURATION", 1.5)
-    # Buffer length (seconds) after which it is trimmed at the end of the last
-    # committed sentence. Longer = more context per decode but more GPU time.
+    # Buffer length before trimming at the last committed sentence end.
     stream_trim_duration: float = _float("STREAM_TRIM_DURATION", 10.0)
-    # Words ending within this many seconds of the buffer end are not committed.
+    # Words ending this close to the buffer end stay uncommitted.
     stream_holdback: float = _float("STREAM_HOLDBACK", 0.0)
 
     # --- SSE streaming (POST /v1/audio/transcriptions with stream=true) ---
-    # Uploaded audio is split into chunks of at most this many seconds, each
-    # transcribed in turn and emitted as a ``transcript.text.delta`` event.
+    # Max audio (s) per SSE chunk/delta.
     sse_chunk_duration: float = _float("SSE_CHUNK_DURATION", 20.0)
-    # Chunk boundaries are placed at the quietest point within this many seconds
-    # before the chunk limit, so words are not cut in half.
+    # Window before the chunk limit searched for a quiet cut point.
     sse_split_search: float = _float("SSE_SPLIT_SEARCH", 4.0)
 
 
