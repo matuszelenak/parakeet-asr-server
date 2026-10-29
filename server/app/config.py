@@ -65,6 +65,12 @@ class Settings:
 
     # Local-attention context window used for long-form transcription.
     longform_context: int = _int("LONGFORM_CONTEXT", 256)
+    # Audio longer than this is transcribed with local-attention windowing
+    # automatically. Whole-file full-context attention is quadratic and, past
+    # ~30 s, its CUDA allocations are retained for the life of the process (a
+    # 9-minute upload can pin >9 GiB); chunked local attention is bounded and
+    # released. 0 disables the auto switch.
+    longform_auto_seconds: float = _float("LONGFORM_AUTO_SECONDS", 30.0)
 
     # Built frontend to serve; empty = no static serving (Vite handles the UI).
     static_dir: str = os.environ.get("STATIC_DIR", "")

@@ -282,6 +282,19 @@ def _result_text(result: Any) -> str:
     return getattr(result, "text", "") or ""
 
 
+def _longform_for(duration: float, *, requested: bool = False) -> bool:
+    """Use local-attention windowing for anything over LONGFORM_AUTO_SECONDS.
+
+    Whole-file full-context attention is quadratic in the sequence length and,
+    past ~30 s, its CUDA allocations are retained for the life of the process -
+    a 9-minute upload can pin >9 GiB on the card until restart. Chunked local
+    attention is bounded at any length and its transient is released, so long
+    audio is auto-routed there. An explicit ``longform=true`` still forces it
+    for shorter audio.
+    """
+    return requested or duration > settings.longform_auto_seconds
+
+
 def _admission_http_error(exc: PoolError) -> HTTPException:
     """Map scheduler admission failures onto HTTP 503 + ``Retry-After``."""
     return HTTPException(
@@ -478,7 +491,10 @@ async def _openai_transcribe_stream(
                     path = float32_to_wav_path(chunk)
                     try:
                         result = await _run_pool(
-                            path, len(chunk) / TARGET_SR, longform=longform, **languages
+                            path,
+                            len(chunk) / TARGET_SR,
+                            longform=_longform_for(len(chunk) / TARGET_SR, requested=longform),
+                            **languages,
                         )
                     finally:
                         _cleanup(path, "file")
@@ -525,7 +541,11 @@ async def _openai_transcribe(
     audio, duration, kind = await _read_and_prepare(file)
     try:
         result = await _run_pool(
-            audio, duration, timestamps=want_timestamps, longform=longform, **languages
+            audio,
+            duration,
+            timestamps=want_timestamps,
+            longform=_longform_for(duration, requested=longform),
+            **languages,
         )
     finally:
         _cleanup(audio, kind)
@@ -605,7 +625,9 @@ async def transcribe(
     languages = _resolve_languages(source_lang, target_lang)
     audio, duration, kind = await _read_and_prepare(file)
     try:
-        result = await _run_pool(audio, duration, **languages)
+        result = await _run_pool(
+            audio, duration, longform=_longform_for(duration), **languages
+        )
     finally:
         _cleanup(audio, kind)
     return TranscriptionResponse(text=_result_text(result))
@@ -621,7 +643,13 @@ async def transcribe_timestamps(
     languages = _resolve_languages(source_lang, target_lang)
     audio, duration, kind = await _read_and_prepare(file)
     try:
-        result = await _run_pool(audio, duration, timestamps=True, **languages)
+        result = await _run_pool(
+            audio,
+            duration,
+            timestamps=True,
+            longform=_longform_for(duration),
+            **languages,
+        )
     finally:
         _cleanup(audio, kind)
 

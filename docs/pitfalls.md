@@ -175,6 +175,26 @@ transcripts suggests they are equally good.
 before drawing conclusions. Comparisons across model families are still valid —
 the transducer/AED gaps were 3–5 points.
 
+## Full-context attention pins GPU memory on long files
+
+**Symptom**: one long upload (the OpenAI route is the one LiteLLM proxies)
+degrades the card for the life of the process. Measured after single files:
+40 s -> 136 GiB held, 3 min -> 137 GiB, 6 min -> 141 GiB, 9 min -> OOM
+(`CUDA out of memory … This process has 9.17 GiB memory in use`). Only a restart
+releases it.
+
+**Cause**: whole-file decoding uses full-context self-attention
+(`att_context_size=[-1, -1]`), which is quadratic in the sequence length. Its
+large CUDA allocations are retained by the caching allocator and never returned,
+so each longer file ratchets the resident memory up.
+
+**Fix**: auto-route audio over `LONGFORM_AUTO_SECONDS` (default 30 s) through
+local-attention windowing (`rel_pos_local_attn`, bounded context), the same mode
+`/v1/transcribe/longform` uses. It is bounded at any length and its transient is
+released: the 9-minute file decodes in 12.5 s with a +3.4 GiB transient that
+returns to baseline. `longform=true` still forces the mode for shorter audio,
+and `LONGFORM_AUTO_SECONDS=0` turns the auto switch off.
+
 ## audio.cpp quirks (observed during the comparison)
 
 Not this project's bugs, but they shaped the comparison in

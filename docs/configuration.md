@@ -18,6 +18,7 @@ complete worked examples.
 | `NUM_WORKERS` | `0` (one per GPU) | Number of model replicas |
 | `DEVICES` | _(auto)_ | Explicit device list, e.g. `cuda:0,cuda:1` |
 | `LONGFORM_CONTEXT` | `256` | Local-attention context window for long-form mode |
+| `LONGFORM_AUTO_SECONDS` | `30` | Auto-switch to long-form decoding for audio longer than this (0 disables); prevents full-context attention from pinning GPU memory |
 | `DEFAULT_SOURCE_LANG` | _(unset, = `en`)_ | Default source language for models that take language arguments (Canary) |
 | `DEFAULT_TARGET_LANG` | _(unset, = source)_ | Default target language; equal to source = transcribe, different = translate |
 
