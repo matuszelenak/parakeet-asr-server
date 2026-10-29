@@ -4,6 +4,7 @@
   import { Recorder } from './lib/recorder'
   import { blobToWav16kMono } from './lib/wav'
   import {
+    prewarmVad,
     transcribe,
     fetchCapabilities,
     VadTranscriber,
@@ -144,9 +145,13 @@
     else void startVad()
   }
 
-  // Stop VAD when leaving the live tab.
+  // Start downloading the VAD assets as soon as the live tab is opened (that
+  // transfer — up to ~16 MB on a cold cache — would otherwise happen after the
+  // user clicks the mic), and stop the session when leaving the tab.
   $effect(() => {
-    if (activeTab !== 'live' && streaming) {
+    if (activeTab === 'live') {
+      void prewarmVad()
+    } else if (streaming) {
       void stopVad()
     }
   })

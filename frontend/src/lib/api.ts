@@ -120,6 +120,37 @@ export interface TranscribeOptions {
 // sent which causes the server to finalise the current segment and close the
 // connection. The class then reopens the WebSocket automatically for the next
 // utterance.
+// The live path pulls the Silero VAD runtime from this origin: a ~14 MB wasm
+// build of onnxruntime plus a 2 MB onnx model (names kept in sync with the
+// "copy-assets" task in deno.json). Fetching them only when the user hits the
+// mic makes the whole download feel like a stall, so start it as soon as the
+// live tab is opened — by the time the mic is clicked they are in the HTTP
+// cache (the server serves them precompressed and with a week of
+// Cache-Control, see app/main.py).
+const VAD_ASSETS = [
+  '/silero_vad_v5.onnx',
+  '/vad.worklet.bundle.min.js',
+  '/ort-wasm-simd-threaded.wasm',
+]
+
+let vadPrewarm: Promise<void> | null = null
+
+export function prewarmVad(): Promise<void> {
+  vadPrewarm ??= Promise.all(
+    VAD_ASSETS.map(async (url) => {
+      try {
+        // force-cache: reuse anything already cached instead of revalidating,
+        // arrayBuffer(): make sure the body is fully read so it lands in cache.
+        const res = await fetch(url, { cache: 'force-cache' })
+        if (res.ok) await res.arrayBuffer()
+      } catch {
+        // Best effort: start() fetches whatever is missing.
+      }
+    }),
+  ).then(() => undefined)
+  return vadPrewarm
+}
+
 export class VadTranscriber {
   private myvad: import('@ricky0123/vad-web').MicVAD | null = null
   private ws: WebSocket | null = null
@@ -203,7 +234,7 @@ export class VadTranscriber {
     await this._openWs()
     this.onState('listening')
 
-    const { MicVAD } = await import('@ricky0123/vad-web')
+    const [, { MicVAD }] = await Promise.all([prewarmVad(), import('@ricky0123/vad-web')])
 
     this.myvad = await MicVAD.new({
       model: 'v5',
