@@ -144,7 +144,7 @@ cache, every visit.
 without `Cache-Control`, and the fetch only started on click — 16.5 MB of pure
 latency after the button press.
 
-**Fix**: gzip them at image build (16.5 MB → 5.3 MB on the wire), a week of
+**Fix**: gzip them at image build (16.5 MB → 5.6 MB on the wire), a week of
 `Cache-Control`, and `prewarmVad()` prefetches them when the Live tab opens so the
 transfer overlaps with the user picking up the mic. Compressing per request was
 rejected: ~1 s of the single event loop would stall live streams.

@@ -106,13 +106,13 @@ contents: **[docs/deployment.md](docs/deployment.md#running-two-model-instances)
 ```bash
 cd server
 uv sync
-uv run uvicorn app.main:app --host 0.0.0.0 --port 9000
+uv run granian --interface asgi --host 0.0.0.0 --port 9000 app.main:app
 ```
 
-(`granian` is what the images use — see
-[docs/deployment.md](docs/deployment.md#asgi-server-granian). For a host run,
-`uv run granian --interface asgi --host 0.0.0.0 --port 9000 app.main:app` from
-`server/` behaves the same.)
+Granian, like the images: uvicorn's WebSocket handling breaks live sessions once
+a transducer model has run an inference
+([why](docs/pitfalls.md#uvicorn-drops-websocket-upgrades-after-transducer-inference)).
+For reload-on-change, prefer the dev stack (`docker compose watch`).
 
 ### Frontend (Deno)
 

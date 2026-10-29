@@ -1,8 +1,8 @@
 # Configuration
 
-Everything is configured through environment variables. `.env.example` in the
-repository root carries the same list with inline comments and is copied to
-`.env` for the dev stack; the two production profiles
+Everything is configured through environment variables. `.env.example` (copied
+to `.env` for the dev stack) covers the ones you normally set; everything below
+is the full list. The two production profiles
 ([`.env.parakeet`](../.env.parakeet), [`.env.canary`](../.env.canary)) are
 complete worked examples.
 
