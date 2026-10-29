@@ -41,6 +41,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 ENV UV_LINK_MODE=copy \
     UV_PYTHON_PREFERENCE=managed \
+    UV_PYTHON=3.12 \
     UV_COMPILE_BYTECODE=1 \
     UV_CONCURRENT_INSTALLS=8 \
     HF_HOME=/cache/hf \
@@ -68,4 +69,9 @@ EXPOSE 9000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=600s --retries=5 \
     CMD wget --no-verbose --tries=1 http://localhost:9000/health || exit 1
 
-CMD ["uv", "run", "--no-dev", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "9000"]
+# granian, not uvicorn: with uvicorn 0.54 every WebSocket implementation stops
+# accepting upgrades once a transducer model (Parakeet-TDT family) has run an
+# inference in the process (truncated handshake request). See server/Dockerfile
+# and README "ASGI server (granian)". One worker: pool, live-session counters and
+# metrics are per process.
+CMD ["/app/.venv/bin/granian", "--interface", "asgi", "--host", "0.0.0.0", "--port", "9000", "--workers", "1", "--log-level", "info", "app.main:app"]
