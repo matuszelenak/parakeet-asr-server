@@ -505,15 +505,18 @@ own env profile, its own port and its own bundled UI:
 
 ```bash
 make build                     # production image (frontend + API), shared by both
-GPU=0 make run-parakeet        # Parakeet Ultra  -> http://localhost:9000
-GPU=1 make run-canary          # Canary 1B v2    -> http://localhost:9001
+make run-parakeet              # Parakeet Ultra, GPU 0 -> http://localhost:9000
+make run-canary                # Canary 1B v2,   GPU 1 -> http://localhost:9001
+make run-both                  # both at once
+GPU=2 make run-canary          # explicit GPU always wins
 make status                    # model, precision, language mode, stream slots, queue
 make logs-parakeet | make stop-parakeet | make stop-all
-make run-both                  # parakeet on GPU_PARAKEET (0), canary on GPU_CANARY (1)
 ```
 
-The GPU is chosen per invocation (`GPU=<n>`); everything else comes from the
-profile file, which is passed as `--env-file` to
+The GPU is chosen per invocation (`GPU=<n>`, else `GPU_PARAKEET` / `GPU_CANARY`,
+defaulting to 0 and 1, so a bare `make run-canary` never lands on the Parakeet
+GPU); everything else comes from the profile file, which is passed as
+`--env-file` to
 `docker-compose.prod.yml` and therefore *replaces* `.env` for that instance:
 
 | | `.env.parakeet` | `.env.canary` |

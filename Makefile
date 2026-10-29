@@ -3,15 +3,16 @@
 # Two independent instances from one production image (UI + API bundled, served
 # on a single port each):
 #
-#   GPU=0 make run-parakeet      # Parakeet Ultra   -> http://localhost:9000
-#   GPU=1 make run-canary        # Canary 1B v2     -> http://localhost:9001
-#   make run-both                # parakeet on GPU 0, canary on GPU 1
+#   make run-parakeet            # Parakeet Ultra, GPU 0 -> http://localhost:9000
+#   make run-canary              # Canary 1B v2,   GPU 1 -> http://localhost:9001
+#   make run-both                # both, GPU_PARAKEET=0 / GPU_CANARY=1
+#   GPU=2 make run-canary        # explicit GPU always wins
 #
 # Each instance has its own env profile (.env.parakeet / .env.canary) and its own
 # compose project (`asr-parakeet`, `asr-canary`), so they can run at the same
 # time without touching each other. Model, precision, streaming tuning, port and
 # container name all live in the profile; only the GPU is chosen per invocation
-# (GPU=n, default 0).
+# (`GPU=n`, else the per-instance GPU_PARAKEET / GPU_CANARY default).
 #
 # Other useful targets: build, ps, status, logs-<instance>, stop-<instance>,
 # stop-all, dev-down. `make` alone prints this list.
@@ -23,7 +24,10 @@ COMPOSE_FILE := docker-compose.prod.yml
 INSTANCES    := parakeet canary
 
 # --- tunables ----------------------------------------------------------------
-GPU          ?= 0
+# An explicit `GPU=<n>` wins; otherwise each instance has its own default, so a
+# bare `make run-canary` can never land on the GPU the parakeet instance uses
+# (compose would happily recreate it there — the container would then share or
+# contend for memory instead of failing).
 GPU_PARAKEET ?= 0
 GPU_CANARY   ?= 1
 HEALTH_TIMEOUT_S ?= 420
@@ -31,6 +35,9 @@ HEALTH_TIMEOUT_S ?= 420
 # Resolve an instance profile: e.g. `make run-parakeet` -> port/name from .env.parakeet
 port_of  = $(shell set -a; . ./.env.$(1); set +a; echo $$HOST_PORT)
 name_of  = $(shell set -a; . ./.env.$(1); set +a; echo $$CONTAINER_NAME)
+
+# GPU for an instance: explicit GPU=<n> > GPU_<INSTANCE> > default
+gpu_for = $(if $(filter command line environment,$(origin GPU)),$(GPU),$(GPU_$(shell echo $(1) | tr a-z A-Z)))
 
 # docker compose invocation for one instance, `$(2)` = GPU index
 compose = GPU=$(2) docker compose -f $(COMPOSE_FILE) -p asr-$(1) --env-file .env.$(1)
@@ -58,38 +65,38 @@ build: ## Build the production image (frontend bundled) used by both instances
 
 # --- run ---------------------------------------------------------------------
 .PHONY: run-parakeet
-run-parakeet: ## Start Parakeet Ultra (GPU=<n>, default 0) on http://localhost:9000
-	@echo "starting parakeet on GPU $(GPU)"
-	$(call compose,parakeet,$(GPU)) up -d --build
+run-parakeet: ## Start Parakeet Ultra (GPU=<n>, default GPU_PARAKEET) on :9000
+	@echo "starting parakeet on GPU $(call gpu_for,parakeet)"
+	$(call compose,parakeet,$(call gpu_for,parakeet)) up -d --build
 	$(call wait_healthy,parakeet)
 
 .PHONY: run-canary
-run-canary: ## Start Canary 1B v2 (GPU=<n>, default 0) on http://localhost:9001
-	@echo "starting canary on GPU $(GPU)"
-	$(call compose,canary,$(GPU)) up -d --build
+run-canary: ## Start Canary 1B v2 (GPU=<n>, default GPU_CANARY) on :9001
+	@echo "starting canary on GPU $(call gpu_for,canary)"
+	$(call compose,canary,$(call gpu_for,canary)) up -d --build
 	$(call wait_healthy,canary)
 
 .PHONY: run-both
 run-both: ## Start both instances (parakeet GPU_PARAKEET, canary GPU_CANARY)
-	@if [ "$(GPU_PARAKEET)" = "$(GPU_CANARY)" ]; then \
-	  echo "refusing to start both on GPU $(GPU_PARAKEET): set GPU_PARAKEET / GPU_CANARY"; exit 1; fi
-	@echo "starting parakeet on GPU $(GPU_PARAKEET), canary on GPU $(GPU_CANARY)"
-	$(call compose,parakeet,$(GPU_PARAKEET)) up -d --build
+	@if [ "$(call gpu_for,parakeet)" = "$(call gpu_for,canary)" ]; then \
+	  echo "refusing to start both on GPU $(call gpu_for,parakeet): set GPU_PARAKEET or GPU_CANARY"; exit 1; fi
+	@echo "starting parakeet on GPU $(call gpu_for,parakeet), canary on GPU $(call gpu_for,canary)"
+	$(call compose,parakeet,$(call gpu_for,parakeet)) up -d --build
 	$(call wait_healthy,parakeet)
-	$(call compose,canary,$(GPU_CANARY)) up -d --build
+	$(call compose,canary,$(call gpu_for,canary)) up -d --build
 	$(call wait_healthy,canary)
 
 # --- stop / restart ----------------------------------------------------------
 .PHONY: stop-parakeet stop-canary stop-all restart-parakeet restart-canary
 stop-parakeet: ## Stop and remove the parakeet instance
-	$(call compose,parakeet,$(GPU)) down
+	$(call compose,parakeet,$(call gpu_for,parakeet)) down
 
 stop-canary: ## Stop and remove the canary instance
-	$(call compose,canary,$(GPU)) down
+	$(call compose,canary,$(call gpu_for,canary)) down
 
 stop-all: ## Stop and remove both instances
-	-$(call compose,parakeet,$(GPU_PARAKEET)) down
-	-$(call compose,canary,$(GPU_CANARY)) down
+	-$(call compose,parakeet,$(call gpu_for,parakeet)) down
+	-$(call compose,canary,$(call gpu_for,canary)) down
 	@echo "both instances stopped"
 
 restart-parakeet: stop-parakeet run-parakeet ## Recreate the parakeet instance
@@ -98,8 +105,8 @@ restart-canary: stop-canary run-canary ## Recreate the canary instance
 # --- inspect -----------------------------------------------------------------
 .PHONY: ps status
 ps: ## Show both instances (compose project state)
-	@echo "== parakeet (project asr-parakeet)"; $(call compose,parakeet,$(GPU_PARAKEET)) ps || true
-	@echo "== canary   (project asr-canary)";   $(call compose,canary,$(GPU_CANARY)) ps || true
+	@echo "== parakeet (project asr-parakeet)"; $(call compose,parakeet,$(call gpu_for,parakeet)) ps || true
+	@echo "== canary   (project asr-canary)";   $(call compose,canary,$(call gpu_for,canary)) ps || true
 
 status: ## Show health, model, precision, stream slots and queue for both
 	@for i in $(INSTANCES); do \
@@ -152,6 +159,6 @@ help: ## Show this help
 	  | sort \
 	  | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
 	@echo
-	@echo "GPUs: parakeet -> GPU=<n> (default $(GPU)); both -> GPU_PARAKEET=$(GPU_PARAKEET) GPU_CANARY=$(GPU_CANARY)"
+	@echo "GPUs: parakeet -> $(call gpu_for,parakeet), canary -> $(call gpu_for,canary) (override with GPU=<n>)"
 	@echo "Profiles: .env.parakeet (:$(call port_of,parakeet))  .env.canary (:$(call port_of,canary))"
 	@echo "Both instances serve their own bundled UI (production image)."
