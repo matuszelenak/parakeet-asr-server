@@ -11,7 +11,7 @@ Usage:
 Examples:
     # straight to the ASR server
     python scripts/test_sse.py sample.wav
-    # through a LiteLLM proxy pass-through route (see README)
+    # through a LiteLLM proxy pass-through route (see docs/api.md)
     python scripts/test_sse.py sample.wav --base-url http://localhost:4000/parakeet/v1 --api-key sk-...
 
 Requires:

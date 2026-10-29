@@ -81,6 +81,6 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=600s --retries=5 \
 # granian, not uvicorn: with uvicorn 0.54 every WebSocket implementation stops
 # accepting upgrades once a transducer model (Parakeet-TDT family) has run an
 # inference in the process (truncated handshake request). See server/Dockerfile
-# and README "ASGI server (granian)". One worker: pool, live-session counters and
+# and docs/deployment.md "ASGI server (granian)". One worker: pool, live-session counters and
 # metrics are per process.
 CMD ["/app/.venv/bin/granian", "--interface", "asgi", "--host", "0.0.0.0", "--port", "9000", "--workers", "1", "--log-level", "info", "app.main:app"]
