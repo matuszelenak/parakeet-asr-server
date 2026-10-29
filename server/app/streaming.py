@@ -87,6 +87,7 @@ async def continuous_transcriber(
     context_duration: float = 1.5,
     trim_duration: float = 10.0,
     holdback: float = 0.0,
+    stats: dict[str, Any] | None = None,
 ) -> AsyncGenerator[StreamEvent, None]:
     """Yield StreamEvent objects as speech is transcribed incrementally.
 
@@ -108,6 +109,8 @@ async def continuous_transcriber(
             the last committed sentence.
         holdback: words ending within this many seconds of the buffer end are
             not committed yet.
+        stats: optional dict filled in as the session progresses (``commit_end``,
+            ``n_committed``, ``n_partial``); used for metrics, not on the wire.
     """
     buffer = np.empty(0, dtype=np.float32)
     buf_offset = 0.0  # stream time of buffer[0]
@@ -145,6 +148,9 @@ async def continuous_transcriber(
         nonlocal commit_end, segment_id
         committed.extend(words)
         commit_end = words[-1]["end"]
+        if stats is not None:
+            stats["commit_end"] = commit_end
+            stats["n_committed"] = stats.get("n_committed", 0) + 1
         event = StreamEvent(type="committed", text=_text(words), start=words[0]["start"], id=segment_id)
         segment_id += 1
         return event
@@ -211,6 +217,8 @@ async def continuous_transcriber(
         # ── Partial update ───────────────────────────────────────────────────
         tail = words
         if tail:
+            if stats is not None:
+                stats["n_partial"] = stats.get("n_partial", 0) + 1
             yield StreamEvent(type="partial", text=_text(tail), start=tail[0]["start"], id=segment_id)
 
     # ── Stream ended: re-transcribe any unseen audio, emit the rest ──────────

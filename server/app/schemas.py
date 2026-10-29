@@ -97,6 +97,29 @@ class StreamConfig(BaseModel):
     holdback: float | None = None
 
 
+class QueueStats(BaseModel):
+    """Scheduler queue state (exposed on /health and /metrics)."""
+
+    pending: int = 0
+    inflight: int = 0
+    capacity: int = 0
+
+
+class BatchStats(BaseModel):
+    """Batching scheduler configuration, for operators."""
+
+    window_ms: int = 0
+    max_batch_size: int = 1
+    max_batch_audio_seconds: float = 0.0
+
+
+class StreamCapacity(BaseModel):
+    """Live-stream admission limits."""
+
+    active: int = 0
+    limit: int = 0
+
+
 class HealthResponse(BaseModel):
     status: str
     model: str
@@ -106,6 +129,14 @@ class HealthResponse(BaseModel):
     # and the list of supported languages (empty when unsupported).
     supports_languages: bool = False
     languages: list[LanguageInfo] = []
+    # Scheduler state, so an orchestrator can scale on queue pressure rather
+    # than only on readiness.
+    queue: QueueStats | None = None
+    batching: BatchStats | None = None
+    stream_capacity: StreamCapacity | None = None
+    # Inference numerics actually in use (e.g. "bfloat16" + "high" for TF32).
+    dtype: str | None = None
+    matmul_precision: str | None = None
 
 
 class TranscriptTextDeltaEvent(BaseModel):

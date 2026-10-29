@@ -40,9 +40,8 @@ from .audio import (
     decode_16k_mono,
     float32_to_wav_path,
     split_on_silence,
-    to_wav16k_mono,
-    wav_duration_seconds,
 )
+from . import metrics
 from .config import settings
 from .languages import (
     DEFAULT_LANGUAGE,
@@ -50,8 +49,9 @@ from .languages import (
     Language,
     model_supports_languages,
 )
-from .model_pool import pool
+from .model_pool import PoolError, pool
 from .schemas import (
+    BatchStats,
     CharTimestamp,
     HealthResponse,
     LanguageInfo,
@@ -59,7 +59,9 @@ from .schemas import (
     ModelList,
     OpenAIError,
     OpenAIErrorBody,
+    QueueStats,
     SegmentTimestamp,
+    StreamCapacity,
     StreamConfig,
     StreamEvent,
     TimestampedResponse,
@@ -71,6 +73,26 @@ from .schemas import (
     WordTimestamp,
 )
 from .streaming import continuous_transcriber
+
+# 16 kHz mono everywhere (see audio.TARGET_SR); local alias for readability in
+# the WebSocket handler's byte accounting.
+SAMPLING_RATE = TARGET_SR
+
+# Live WebSocket sessions currently open in this process (admission control).
+_active_streams = 0
+
+
+def _stream_limit() -> int:
+    """Concurrent live-session limit, resolved from ``MAX_CONCURRENT_STREAMS``.
+
+    ``0`` means auto: a bf16/fp16 replica decodes roughly 2.5x faster than fp32,
+    so it can hold about twice as many real-time sessions. Measured on one RTX
+    3090 (Slovak, 500 ms frames): 12 sessions in bf16, 8 comfortably; 4 in fp32.
+    """
+    if settings.max_concurrent_streams > 0:
+        return settings.max_concurrent_streams
+    reduced = pool.stats().get("dtype") in {"bfloat16", "float16"}
+    return 8 if reduced else 4
 
 logfire.configure(
     service_name="parakeet-asr-server",
@@ -105,6 +127,56 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# --- Metrics ---------------------------------------------------------------
+
+def _route_label(request: Request) -> str:
+    """Route *template* (e.g. ``/v1/models/{model_id}``) for low cardinality."""
+    route = request.scope.get("route")
+    path = getattr(route, "path", None)
+    return path or "unmatched"
+
+
+@app.middleware("http")
+async def _metrics_middleware(request: Request, call_next):
+    """Count requests and observe latency by route template.
+
+    For streaming responses (``stream=true``) the histogram records the time
+    until the response *starts*, not until the last event is sent; the SSE work
+    itself shows up in the ``asr_inference_*`` metrics.
+    """
+    if not settings.metrics_enabled or request.url.path == "/metrics":
+        return await call_next(request)
+
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        metrics.http_requests_total.labels(
+            route=_route_label(request), method=request.method, status="500"
+        ).inc()
+        raise
+    route = _route_label(request)
+    metrics.http_requests_total.labels(
+        route=route, method=request.method, status=str(response.status_code)
+    ).inc()
+    metrics.http_request_duration_seconds.labels(route=route).observe(
+        time.perf_counter() - started
+    )
+    return response
+
+
+if settings.metrics_enabled:
+
+    @app.get("/metrics", include_in_schema=False)
+    async def prometheus_metrics() -> Response:
+        """Prometheus exposition (text format 0.0.4)."""
+        from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+
+        return Response(
+            content=generate_latest(metrics.REGISTRY), media_type=CONTENT_TYPE_LATEST
+        )
 
 
 # --- OpenAI-style errors ------------------------------------------------------
@@ -161,28 +233,45 @@ async def _read_upload(upload: UploadFile) -> bytes:
     raw = await upload.read()
     max_bytes = settings.max_upload_mb * 1024 * 1024
     if len(raw) > max_bytes:
+        metrics.rejected_total.labels(reason="upload_too_large").inc()
         raise HTTPException(
             status_code=413,
             detail=f"file exceeds {settings.max_upload_mb} MB limit",
         )
     if not raw:
         raise HTTPException(status_code=400, detail="empty upload")
+    metrics.upload_bytes.observe(len(raw))
     return raw
 
 
-async def _read_and_prepare(upload: UploadFile) -> str:
-    """Validate the upload size, decode it, and return a temp 16k mono WAV path."""
+async def _read_and_prepare(upload: UploadFile) -> tuple[Any, float, str]:
+    """Decode an upload and return ``(input, duration_s, kind)``.
+
+    Short audio is returned as an in-memory float32 16 kHz array (no temp file);
+    anything longer than ``INLINE_AUDIO_MAX_SECONDS`` is written to a temporary
+    16 kHz mono WAV so NeMo's chunked long-form decoding still applies. The
+    caller must ``_cleanup`` the input when ``kind == "file"``.
+    """
     raw = await _read_upload(upload)
     try:
         # Decoding/resampling is CPU-bound; keep it off the event loop.
-        return await asyncio.to_thread(to_wav16k_mono, raw)
+        samples = await asyncio.to_thread(decode_16k_mono, raw)
     except InvalidAudioError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    duration = len(samples) / TARGET_SR
+    if duration <= settings.inline_audio_max_seconds:
+        return samples, duration, "array"
+    path = await asyncio.to_thread(float32_to_wav_path, samples)
+    return path, duration, "file"
 
-def _cleanup(path: str) -> None:
+
+def _cleanup(audio: Any, kind: str) -> None:
+    """Delete a temporary WAV unless the input was an in-memory array."""
+    if kind != "file":
+        return
     try:
-        os.remove(path)
+        os.remove(audio)
     except OSError:
         pass
 
@@ -191,18 +280,56 @@ def _result_text(result: Any) -> str:
     return getattr(result, "text", "") or ""
 
 
+def _admission_http_error(exc: PoolError) -> HTTPException:
+    """Map scheduler admission failures onto HTTP 503 + ``Retry-After``."""
+    return HTTPException(
+        status_code=503,
+        detail=str(exc),
+        headers={"Retry-After": str(settings.retry_after_s)},
+    )
+
+
+async def _run_pool(audio: Any, duration: float, **kwargs: Any) -> Any:
+    """Submit one input to the scheduler, translating admission errors to 503.
+
+    ``duration`` is passed along so the scheduler can batch and bound VRAM
+    without re-reading the input.
+    """
+    metrics.audio_seconds_total.inc(duration)
+    try:
+        results = await pool.transcribe([audio], durations=[duration], **kwargs)
+    except PoolError as exc:
+        logfire.warning("request rejected: {error}", error=str(exc))
+        raise _admission_http_error(exc) from exc
+    return results[0]
+
+
+def _env_language(code: str) -> Language | None:
+    """Parse DEFAULT_SOURCE_LANG / DEFAULT_TARGET_LANG; ignore invalid values."""
+    if not code:
+        return None
+    try:
+        return Language(code)
+    except ValueError:
+        logfire.warning("ignoring unknown language code in env: {code}", code=code)
+        return None
+
+
 def _resolve_languages(
     source_lang: Language | None,
     target_lang: Language | None,
     *,
-    strict: bool = True,
+    strict: bool = False,
 ) -> dict[str, str]:
     """Validate language args against the configured model's capabilities.
 
     Returns kwargs (``source_lang`` / ``target_lang``) to pass to the model, or
-    an empty dict when the model does not use language selection. With
-    ``strict=False`` languages are silently ignored for such models (OpenAI
-    clients routinely send ``language`` as a hint).
+    an empty dict when the model does not use language selection. Languages are
+    ignored (``strict=False``, the default) for such models: clients — including
+    this project's own UI, scripts and LiteLLM configs — routinely send a
+    language hint, and a model swap to a transducer (e.g. Parakeet, which
+    auto-detects) must not start failing those requests. Pass ``strict=True`` to
+    reject them with 400 instead.
     """
     if not model_supports_languages(settings.model_name):
         if strict and (source_lang is not None or target_lang is not None):
@@ -212,9 +339,12 @@ def _resolve_languages(
             )
         return {}
 
-    # Canary-style models require both; default to English when omitted.
-    src = source_lang or DEFAULT_LANGUAGE
-    tgt = target_lang or source_lang or DEFAULT_LANGUAGE
+    # Canary-style models require both. Fall back to the deployment default
+    # (DEFAULT_SOURCE_LANG/DEFAULT_TARGET_LANG), then to English.
+    default_src = _env_language(settings.default_source_lang) or DEFAULT_LANGUAGE
+    default_tgt = _env_language(settings.default_target_lang) or default_src
+    src = source_lang or default_src
+    tgt = target_lang or source_lang or default_tgt
     return {"source_lang": src.value, "target_lang": tgt.value}
 
 
@@ -234,24 +364,36 @@ def _parse_language(code: str | None) -> Language | None:
         ) from exc
 
 
+def _as_text(value: Any) -> str:
+    """NeMo returns BPE token timestamps as lists (``['Po']``); flatten to str."""
+    if isinstance(value, (list, tuple)):
+        return "".join(str(part) for part in value)
+    return "" if value is None else str(value)
+
+
 def _extract_words(result: Any) -> list[WordTimestamp]:
     stamps = getattr(result, "timestamp", None) or {}
     return [
-        WordTimestamp(word=w.get("word", ""), start=w["start"], end=w["end"])
+        WordTimestamp(
+            word=_as_text(w.get("word", "")), start=w["start"], end=w["end"]
+        )
         for w in stamps.get("word", [])
     ]
 
 
 def _extract_verbose_segments(result: Any) -> list[VerboseSegment]:
     stamps = getattr(result, "timestamp", None) or {}
+    # Transducer models report word timestamps but no segments; fall back to words
+    # so SRT/VTT output is still populated.
+    entries = stamps.get("segment") or stamps.get("word") or []
     return [
         VerboseSegment(
             id=i,
             start=s["start"],
             end=s["end"],
-            text=s.get("segment", ""),
+            text=_as_text(s.get("segment") or s.get("word") or ""),
         )
-        for i, s in enumerate(stamps.get("segment", []))
+        for i, s in enumerate(entries)
     ]
 
 
@@ -333,14 +475,20 @@ async def _openai_transcribe_stream(
                     # Skip slivers too short to contain speech.
                     if len(chunk) < TARGET_SR // 10:
                         continue
+                    # NB: chunks go through a temp WAV rather than the in-memory
+                    # array path. NeMo's tensor dataset frames a given utterance
+                    # slightly differently from its lhotse path (4 of 31 chunks on
+                    # our Slovak sample differed, mixed quality), so this bulk path
+                    # keeps the lhotse behaviour that the accuracy runs validated;
+                    # the ~15 ms/chunk saved is not worth the wobble here.
                     path = float32_to_wav_path(chunk)
                     try:
-                        results = await pool.transcribe(
-                            [path], longform=longform, **languages
+                        result = await _run_pool(
+                            path, len(chunk) / TARGET_SR, longform=longform, **languages
                         )
                     finally:
-                        _cleanup(path)
-                    text = _result_text(results[0]).strip()
+                        _cleanup(path, "file")
+                    text = _result_text(result).strip()
                     if not text:
                         continue
                     yield _sse(
@@ -380,16 +528,14 @@ async def _openai_transcribe(
     want_word = "word" in timestamp_granularities
     want_timestamps = response_format in {"verbose_json", "srt", "vtt"} or want_word
 
-    path = await _read_and_prepare(file)
+    audio, duration, kind = await _read_and_prepare(file)
     try:
-        duration = wav_duration_seconds(path)
-        results = await pool.transcribe(
-            [path], timestamps=want_timestamps, longform=longform, **languages
+        result = await _run_pool(
+            audio, duration, timestamps=want_timestamps, longform=longform, **languages
         )
     finally:
-        _cleanup(path)
+        _cleanup(audio, kind)
 
-    result = results[0]
     text = _result_text(result)
 
     if response_format == "text":
@@ -431,11 +577,26 @@ async def health() -> HealthResponse:
     )
     return HealthResponse(
         status="ok" if pool.ready else "loading",
-        model=settings.model_name,
+        model=settings.model_path or settings.model_name,
         workers=pool.size,
         ready=pool.ready,
         supports_languages=supports,
         languages=languages,
+        queue=QueueStats(
+            pending=pool.pending,
+            inflight=pool.inflight,
+            capacity=settings.max_queue_size,
+        ),
+        batching=BatchStats(
+            window_ms=settings.batch_window_ms,
+            max_batch_size=settings.max_batch_size,
+            max_batch_audio_seconds=settings.max_batch_audio_seconds,
+        ),
+        stream_capacity=StreamCapacity(
+            active=_active_streams, limit=_stream_limit()
+        ),
+        dtype=pool.stats().get("dtype"),
+        matmul_precision=settings.matmul_precision,
     )
 
 
@@ -447,12 +608,12 @@ async def transcribe(
 ) -> TranscriptionResponse:
     """Plain-text transcription (or translation when target differs from source)."""
     languages = _resolve_languages(source_lang, target_lang)
-    path = await _read_and_prepare(file)
+    audio, duration, kind = await _read_and_prepare(file)
     try:
-        results = await pool.transcribe([path], **languages)
+        result = await _run_pool(audio, duration, **languages)
     finally:
-        _cleanup(path)
-    return TranscriptionResponse(text=_result_text(results[0]))
+        _cleanup(audio, kind)
+    return TranscriptionResponse(text=_result_text(result))
 
 
 @app.post("/v1/transcribe/timestamps", response_model=TimestampedResponse)
@@ -463,25 +624,30 @@ async def transcribe_timestamps(
 ) -> TimestampedResponse:
     """Transcription with word, segment, and char level timestamps."""
     languages = _resolve_languages(source_lang, target_lang)
-    path = await _read_and_prepare(file)
+    audio, duration, kind = await _read_and_prepare(file)
     try:
-        results = await pool.transcribe([path], timestamps=True, **languages)
+        result = await _run_pool(audio, duration, timestamps=True, **languages)
     finally:
-        _cleanup(path)
+        _cleanup(audio, kind)
 
-    result = results[0]
     stamps = getattr(result, "timestamp", None) or {}
 
     words = [
-        WordTimestamp(word=w.get("word", ""), start=w["start"], end=w["end"])
+        WordTimestamp(
+            word=_as_text(w.get("word", "")), start=w["start"], end=w["end"]
+        )
         for w in stamps.get("word", [])
     ]
     segments = [
-        SegmentTimestamp(segment=s.get("segment", ""), start=s["start"], end=s["end"])
-        for s in stamps.get("segment", [])
+        SegmentTimestamp(
+            segment=_as_text(s.get("segment") or s.get("word") or ""),
+            start=s["start"],
+            end=s["end"],
+        )
+        for s in (stamps.get("segment") or stamps.get("word") or [])
     ]
     chars = [
-        CharTimestamp(char=c.get("char", ""), start=c["start"], end=c["end"])
+        CharTimestamp(char=_as_text(c.get("char", "")), start=c["start"], end=c["end"])
         for c in stamps.get("char", [])
     ]
     return TimestampedResponse(
@@ -501,12 +667,12 @@ async def transcribe_longform(
     recordings can be transcribed without exhausting GPU memory.
     """
     languages = _resolve_languages(source_lang, target_lang)
-    path = await _read_and_prepare(file)
+    audio, duration, kind = await _read_and_prepare(file)
     try:
-        results = await pool.transcribe([path], longform=True, **languages)
+        result = await _run_pool(audio, duration, longform=True, **languages)
     finally:
-        _cleanup(path)
-    return TranscriptionResponse(text=_result_text(results[0]))
+        _cleanup(audio, kind)
+    return TranscriptionResponse(text=_result_text(result))
 
 
 _MODEL_CREATED = int(time.time())
@@ -647,15 +813,47 @@ async def transcribe_stream(
     ``committed``– confirmed segment; words will not be revised.
     ``final``    – last segment emitted after end-of-stream.
 
-    One pool worker is occupied for the duration of the session, so the maximum
-    number of concurrent streaming sessions equals the pool size.
+    Admission control: at most ``MAX_CONCURRENT_STREAMS`` sessions may be open
+    (further connections are accepted and closed with 1013), a client may not
+    queue more than ``STREAM_MAX_QUEUE_SECONDS`` of audio ahead of the model
+    (faster-than-real-time feeds are cut off 1013), and a session is closed
+    after ``STREAM_MAX_SESSION_SECONDS``. The model replica is checked out per
+    inference, so batch requests are not blocked by a live session.
     """
-    languages = _resolve_languages(source_lang, target_lang)
+    global _active_streams
+
+    # Lenient: the browser always sends source_lang/target_lang, and a client
+    # cannot know whether the loaded model takes them — ignore them instead of
+    # failing the upgrade (e.g. on a Parakeet/transducer deployment).
+    languages = _resolve_languages(source_lang, target_lang, strict=False)
     await websocket.accept()
 
     if not pool.ready:
         await websocket.close(code=1013, reason="model not ready")
         return
+
+    if _active_streams >= _stream_limit():
+        limit = _stream_limit()
+        metrics.rejected_total.labels(reason="stream_limit").inc()
+        metrics.stream_sessions_total.labels(outcome="rejected").inc()
+        await websocket.close(
+            code=1013,
+            reason=f"server at capacity ({limit} streams); retry",
+        )
+        return
+
+    _active_streams += 1
+    metrics.stream_sessions_active.set(_active_streams)
+    session_started = time.monotonic()
+    session_outcome = "error"
+    received_s = 0.0
+    # Backpressure: a client may queue at most this much *unprocessed* audio
+    # (``STREAM_MAX_QUEUE_SECONDS``). Real-time clients never get near it; a
+    # fast-feed client is closed with 1013 and pointed at the SSE endpoint,
+    # because pausing the ASGI receive path would also stall WebSocket control
+    # frames (pings) and make the session look dead.
+    max_queued_samples = int(settings.stream_max_queue_seconds * SAMPLING_RATE)
+    queued_samples = 0
 
     audio_queue: asyncio.Queue[np.ndarray | None] = asyncio.Queue()
 
@@ -666,6 +864,7 @@ async def transcribe_stream(
     # frame that arrives before any configure message is decoded and queued so
     # no audio is lost.
     cfg = StreamConfig()
+    ended_upfront = False
     try:
         first = await asyncio.wait_for(websocket.receive(), timeout=2.0)
         if first.get("text"):
@@ -675,6 +874,10 @@ async def transcribe_stream(
                     cfg = StreamConfig.model_validate(
                         {k: v for k, v in msg.items() if k != "type"}
                     )
+                elif msg.get("type") == "end":
+                    # A client may end the stream before sending any audio; the
+                    # probe above already consumed that frame.
+                    ended_upfront = True
             except (json.JSONDecodeError, AttributeError, ValueError):
                 pass
         elif first.get("bytes"):
@@ -698,10 +901,16 @@ async def transcribe_stream(
     # ----------------------------------------------------------------------------
 
     async def _reader() -> None:
+        nonlocal received_s, queued_samples, session_outcome
+        if ended_upfront:
+            session_outcome = "ended_by_client"
+            await audio_queue.put(None)
+            return
         try:
             while True:
                 data = await websocket.receive()
                 if data["type"] == "websocket.disconnect":
+                    session_outcome = "client_disconnect"
                     break
                 raw_bytes = data.get("bytes")
                 if raw_bytes:
@@ -709,38 +918,71 @@ async def transcribe_stream(
                         np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32)
                         / 32768.0
                     )
+                    received_s += len(samples) / SAMPLING_RATE
+                    metrics.stream_audio_seconds.inc(len(samples) / SAMPLING_RATE)
+                    queued_samples += len(samples)
+                    if queued_samples > max_queued_samples:
+                        session_outcome = "backpressure"
+                        metrics.rejected_total.labels(reason="stream_backpressure").inc()
+                        await websocket.close(
+                            code=1013,
+                            reason=(
+                                f"client queued more than "
+                                f"{settings.stream_max_queue_seconds:.0f}s of "
+                                "unprocessed audio (faster than the model can keep "
+                                "up); use POST /v1/audio/transcriptions with "
+                                "stream=true for bulk audio"
+                            ),
+                        )
+                        break
                     await audio_queue.put(samples)
+                    if time.monotonic() - session_started > settings.stream_max_session_seconds:
+                        session_outcome = "max_duration"
+                        break
                     continue
                 text = data.get("text")
                 if text:
                     try:
                         if json.loads(text).get("type") == "end":
+                            session_outcome = "ended_by_client"
                             break
                     except (json.JSONDecodeError, AttributeError):
                         pass
         except WebSocketDisconnect:
-            pass
+            session_outcome = "client_disconnect"
         finally:
+            # Aborted sessions (client gone / overloaded / too long) should not keep
+            # the GPU busy decoding audio nobody will hear; an explicit ``end``
+            # still drains the remainder so the tail of the utterance is kept.
+            if session_outcome in {"backpressure", "client_disconnect", "max_duration"}:
+                while not audio_queue.empty():
+                    audio_queue.get_nowait()
+                queued_samples = 0
             await audio_queue.put(None)
 
     async def _audio_gen() -> AsyncGenerator[np.ndarray, None]:
+        nonlocal queued_samples
         while True:
             chunk = await audio_queue.get()
             if chunk is None:
                 return
+            queued_samples = max(0, queued_samples - len(chunk))
             yield chunk
 
     async def _transcribe(samples: np.ndarray) -> Any:
-        path = float32_to_wav_path(samples)
         try:
-            results = await pool.transcribe([path], timestamps=True, **languages)
-            return results[0]
+            # Streaming buffers are passed in memory; no temp file per inference.
+            return await _run_pool(
+                samples, len(samples) / SAMPLING_RATE, timestamps=True, **languages
+            )
+        except PoolError as exc:
+            logfire.warning("streaming inference rejected: {error}", error=str(exc))
+            return None
         except Exception as exc:
             logfire.exception("streaming inference error: {exc}", exc=str(exc))
             return None
-        finally:
-            _cleanup(path)
 
+    stats: dict[str, Any] = {}
     reader_task = asyncio.create_task(_reader())
     try:
         with logfire.span("transcribe_stream"):
@@ -755,15 +997,39 @@ async def transcribe_stream(
                 context_duration=context_duration,
                 trim_duration=trim_duration,
                 holdback=holdback,
+                stats=stats,
             ):
+                if event.type == "committed":
+                    metrics.stream_commits_total.inc()
+                    commit_end = stats.get("commit_end")
+                    if commit_end is not None:
+                        metrics.stream_commit_lag_seconds.observe(
+                            max(0.0, received_s - commit_end)
+                        )
+                elif event.type == "partial":
+                    metrics.stream_partials_total.inc()
                 await websocket.send_text(event.model_dump_json())
     except WebSocketDisconnect:
-        pass
+        session_outcome = "client_disconnect"
+    except Exception:
+        session_outcome = "error"
+        raise
     finally:
         reader_task.cancel()
         try:
             await reader_task
         except (asyncio.CancelledError, WebSocketDisconnect):
+            pass
+        except Exception as exc:  # e.g. starlette's WebSocketDisconnected
+            logfire.debug("stream reader ended: {error}", error=str(exc))
+        _active_streams = max(0, _active_streams - 1)
+        metrics.stream_sessions_active.set(_active_streams)
+        metrics.stream_sessions_total.labels(outcome=session_outcome).inc()
+        metrics.stream_session_seconds.observe(time.monotonic() - session_started)
+        # Closing again is a no-op when the reader already closed the socket.
+        try:
+            await websocket.close()
+        except Exception:
             pass
 
 
