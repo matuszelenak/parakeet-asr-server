@@ -1,15 +1,12 @@
 name: Build & publish Docker image
 
+# Publish on a release tag only. A push to main and the tag that usually
+# follows it are the same commit, so triggering on both built (and pushed) the
+# same image twice. Releases move `latest`; merges do not. Note that `paths`
+# filters do not apply to tag pushes anyway.
 on:
   push:
-    branches: [main]
     tags: ['v*']
-    paths:
-      - 'server/**'
-      - 'frontend/**'
-      - '**.Dockerfile'
-      - 'Dockerfile'
-      - '.github/workflows/**'
   workflow_dispatch:
 
 env:
@@ -58,12 +55,12 @@ jobs:
           images: |
             ${{ env.GHCR_IMAGE }}
             ${{ env.DOCKERHUB_IMAGE }}
+          # is_default_branch is false for tag refs, so `latest` is explicit.
           tags: |
-            type=ref,event=branch
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha,format=short
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest
 
       - name: Build and push
         uses: docker/build-push-action@v7
